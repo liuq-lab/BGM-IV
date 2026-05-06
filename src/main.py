@@ -62,8 +62,6 @@ _FIXED_BENCHMARK_DEFAULTS = {
     "price_points": 20,
     "time_points": 20,
     "w_dim": 1,
-    "fit_model_selection_metric": "structural_mse",
-    "fit_restore_best_weights": True,
     "fit_use_progress_bar": False,
 }
 
@@ -371,29 +369,6 @@ def _get_training_history_structural_keys(history):
     )
 
 
-def _summarize_training_history(history, structural_keys=None):
-    structural_keys = (
-        _get_training_history_structural_keys(history)
-        if structural_keys is None
-        else structural_keys
-    )
-    summaries = []
-    for key in structural_keys:
-        method = key.removeprefix("structural_mse_")
-        method_records = [record for record in history if key in record]
-        if not method_records:
-            continue
-        summaries.append(
-            {
-                "method": method,
-                "key": key,
-                "best_record": min(method_records, key=lambda r: r[key]),
-                "last_record": method_records[-1],
-            }
-        )
-    return summaries
-
-
 def _render_training_history(history):
     if not history:
         return ""
@@ -419,77 +394,7 @@ def _render_training_history(history):
             value = record.get(key)
             row += f" {('-' if value is None else f'{value:.6f}'):>14}"
         lines.append(row)
-
-    for summary in _summarize_training_history(history, structural_keys):
-        method = summary["method"]
-        key = summary["key"]
-        best_record = summary["best_record"]
-        last_record = summary["last_record"]
-        lines.append("")
-        lines.append(
-            "Best structural checkpoint "
-            f"[{method}]: stage={best_record['stage']}, epoch={best_record['epoch']}, "
-            f"structural_MSE={best_record[key]:.6f}"
-        )
-        lines.append(
-            "Last logged structural checkpoint "
-            f"[{method}]: stage={last_record['stage']}, epoch={last_record['epoch']}, "
-            f"structural_MSE={last_record[key]:.6f}"
-        )
     return "\n".join(lines)
-
-
-def _get_training_history_columns(history):
-    return (
-        "stage",
-        "epoch",
-        "include_outcome",
-        "mse_x",
-        "mse_y",
-        "mse_v",
-        *_get_training_history_structural_keys(history),
-    )
-
-
-def _rectangularize_training_history(history):
-    columns = _get_training_history_columns(history)
-    rows = []
-    for record in history:
-        row = {}
-        for column in columns:
-            value = record.get(column)
-            row[column] = "" if value is None else value
-        rows.append(row)
-    return columns, rows
-
-
-def _format_rho_token(value):
-    return _format_demand_design_sweep_value(value).replace("-", "m").replace(".", "p")
-
-
-def _build_training_history_repeat_csv_name(params):
-    slug = _get_demand_design_dataset_meta(params)["slug"]
-    if not _demand_design_uses_rho(params):
-        return (
-            f"training_metric_history_{slug}_"
-            f"n{int(params['n_samples'])}_"
-            f"repeat{int(params.get('repeat_id', 0))}.csv"
-        )
-    return (
-        f"training_metric_history_{slug}_"
-        f"n{int(params['n_samples'])}_rho{_format_rho_token(params['rho'])}_"
-        f"repeat{int(params.get('repeat_id', 0))}.csv"
-    )
-
-
-def _build_training_history_combo_md_name(params):
-    slug = _get_demand_design_dataset_meta(params)["slug"]
-    if not _demand_design_uses_rho(params):
-        return f"training_metric_history_{slug}_n{int(params['n_samples'])}.md"
-    return (
-        f"training_metric_history_{slug}_"
-        f"n{int(params['n_samples'])}_rho{_format_rho_token(params['rho'])}.md"
-    )
 
 
 def _build_demand_design_run_timestamp(now=None):
@@ -573,61 +478,28 @@ def _csv_writer_append_rows(path, fieldnames, rows):
             writer.writerow(row)
 
 
-def _build_checkpoint_summary_rows(summaries, repeat_id, which):
+def _build_results_rows(history, repeat_id):
     rows = []
-    for summary in summaries:
-        record = summary[f"{which}_record"]
+    for key in _get_training_history_structural_keys(history):
+        method = key.removeprefix("structural_mse_")
+        method_records = [record for record in history if key in record]
+        if not method_records:
+            continue
+        result_record = method_records[-1]
         rows.append(
             {
                 "repeat_id": int(repeat_id),
-                "method": summary["method"],
-                "stage": record["stage"],
-                "epoch": record["epoch"],
-                "include_outcome": record["include_outcome"],
-                "mse_x": record["mse_x"],
-                "mse_y": record["mse_y"],
-                "mse_v": record["mse_v"],
-                "structural_mse": record[summary["key"]],
+                "method": method,
+                "stage": result_record["stage"],
+                "epoch": result_record["epoch"],
+                "include_outcome": result_record["include_outcome"],
+                "mse_x": result_record["mse_x"],
+                "mse_y": result_record["mse_y"],
+                "mse_v": result_record["mse_v"],
+                "structural_mse": result_record[key],
             }
         )
     return rows
-
-
-def _append_text(path, content):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(content)
-
-
-def _render_repeat_history_section(
-    run_index,
-    total_runs,
-    params,
-    run_config_text,
-    ranges_text,
-    training_history_text,
-):
-    if _demand_design_uses_rho(params):
-        header_detail = (
-            f"n_samples={params['n_samples']}, rho={params['rho']}, "
-            f"repeat={params['repeat_id']}"
-        )
-    else:
-        header_detail = (
-            f"n_samples={params['n_samples']}, repeat={params['repeat_id']}"
-        )
-    lines = [
-        f"## Demand-design sweep run [{run_index}/{total_runs}]: "
-        f"{header_detail}",
-        "",
-        "```text",
-        run_config_text,
-        ranges_text,
-    ]
-    if training_history_text:
-        lines.extend(["", training_history_text])
-    lines.extend(["```", ""])
-    return "\n".join(lines)
 
 
 def _persist_demand_design_repeat_outputs(
@@ -642,16 +514,7 @@ def _persist_demand_design_repeat_outputs(
     combo_dir = run_root / _build_demand_design_combo_dir_name(params)
     combo_dir.mkdir(parents=True, exist_ok=True)
 
-    columns, rows = _rectangularize_training_history(training_history)
-    repeat_csv_path = combo_dir / _build_training_history_repeat_csv_name(params)
-    with repeat_csv_path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=columns)
-        writer.writeheader()
-        for row in rows:
-            writer.writerow(row)
-
-    summaries = _summarize_training_history(training_history)
-    summary_columns = (
+    result_columns = (
         "repeat_id",
         "method",
         "stage",
@@ -663,29 +526,9 @@ def _persist_demand_design_repeat_outputs(
         "structural_mse",
     )
     _csv_writer_append_rows(
-        combo_dir / "best_structural_checkpoints.csv",
-        summary_columns,
-        _build_checkpoint_summary_rows(summaries, params.get("repeat_id", 0), "best"),
-    )
-    _csv_writer_append_rows(
-        combo_dir / "last_structural_checkpoints.csv",
-        summary_columns,
-        _build_checkpoint_summary_rows(summaries, params.get("repeat_id", 0), "last"),
-    )
-
-    combo_md_path = combo_dir / _build_training_history_combo_md_name(params)
-    if not combo_md_path.exists():
-        combo_md_path.write_text("# Training Metric History\n\n", encoding="utf-8")
-    _append_text(
-        combo_md_path,
-        _render_repeat_history_section(
-            run_index,
-            total_runs,
-            params,
-            run_config_text,
-            ranges_text,
-            _render_training_history(training_history),
-        ),
+        combo_dir / "results.csv",
+        result_columns,
+        _build_results_rows(training_history, params.get("repeat_id", 0)),
     )
 
 

@@ -207,7 +207,8 @@ def test_bgm_iv_records_structural_history(tmp_path):
     assert len(model.training_history) >= 2
     assert model.training_history[0]["stage"] == "post_egm"
     assert np.isfinite(model.training_history[0]["structural_mse"])
-    assert model.best_training_record["epoch"] == 0
+    assert model.training_history[-1]["stage"] == "epoch_eval"
+    assert np.isfinite(model.training_history[-1]["structural_mse"])
 
 
 def test_resolve_training_monitor_methods_defaults_to_structural_methods():
@@ -260,8 +261,6 @@ def test_benchmark_defaults_inject_fixed_values_and_map_methods():
     assert params["time_points"] == 20
     assert params["v_dim"] == 2
     assert params["w_dim"] == 1
-    assert params["fit_model_selection_metric"] == "structural_mse"
-    assert params["fit_restore_best_weights"] is True
     assert params["fit_use_progress_bar"] is False
     assert params["structural_methods"] == ["map"]
     assert params["training_structural_methods"] == ["map"]
@@ -294,8 +293,6 @@ def test_benchmark_defaults_reject_invalid_mnist_v_dim():
         ("Sim_Demand_Design_IV", "v_dim", 3),
         ("Sim_Demand_Design_IV", "noise_seed", 42),
         ("Sim_Demand_Design_IV", "price_points", 21),
-        ("Sim_Demand_Design_IV", "fit_model_selection_metric", "mse_y"),
-        ("Sim_Demand_Design_IV", "fit_restore_best_weights", False),
         ("Sim_Demand_Design_Mnist_IV", "image_seed", 99),
         ("Sim_Demand_Design_Vector_IV", "vector_dim", 128),
         ("Sim_Demand_Design_Vector_IV", "test_vector_seed", 99),
@@ -321,14 +318,12 @@ def test_benchmark_defaults_accept_backward_compatible_default_values():
         "seed": 0,
         "v_dim": 2,
         "price_points": 20,
-        "fit_restore_best_weights": True,
     }
 
     main_module._apply_demand_design_benchmark_defaults(params)
 
     assert params["seed"] == 0
     assert params["v_dim"] == 2
-    assert params["fit_restore_best_weights"] is True
 
 
 def test_print_demand_design_run_config(capsys):
@@ -864,7 +859,7 @@ def test_build_demand_design_combo_dir_name_uses_requested_format():
     )
 
 
-def test_rectangularize_training_history_expands_sorted_structural_columns():
+def test_build_results_rows_uses_final_structural_record():
     history = [
         {
             "stage": "egm_init",
@@ -886,19 +881,21 @@ def test_rectangularize_training_history_expands_sorted_structural_columns():
         },
     ]
 
-    columns, rows = main_module._rectangularize_training_history(history)
+    rows = main_module._build_results_rows(history, repeat_id=1)
 
-    assert columns == (
-        "stage",
-        "epoch",
-        "include_outcome",
-        "mse_x",
-        "mse_y",
-        "mse_v",
-        "structural_mse_map",
-    )
-    assert rows[0]["structural_mse_map"] == 10.0
-    assert rows[1]["structural_mse_map"] == 8.0
+    assert rows == [
+        {
+            "repeat_id": 1,
+            "method": "map",
+            "stage": "epoch_eval",
+            "epoch": 10,
+            "include_outcome": True,
+            "mse_x": 0.2,
+            "mse_y": 0.1,
+            "mse_v": 0.05,
+            "structural_mse": 8.0,
+        }
+    ]
 
 
 def test_persist_demand_design_repeat_outputs_writes_expected_files(tmp_path):
@@ -944,27 +941,11 @@ def test_persist_demand_design_repeat_outputs_writes_expected_files(tmp_path):
     combo_dir = run_root / "n_samples:1000-rho:0.25-v_dim:2"
     assert combo_dir.exists()
 
-    repeat_csv = combo_dir / "training_metric_history_sim_demand_design_iv_n1000_rho0p25_repeat1.csv"
-    best_csv = combo_dir / "best_structural_checkpoints.csv"
-    last_csv = combo_dir / "last_structural_checkpoints.csv"
-    combo_md = combo_dir / "training_metric_history_sim_demand_design_iv_n1000_rho0p25.md"
+    assert sorted(path.name for path in combo_dir.iterdir()) == ["results.csv"]
 
-    assert repeat_csv.exists()
-    assert best_csv.exists()
-    assert last_csv.exists()
-    assert combo_md.exists()
-
-    best_lines = best_csv.read_text(encoding="utf-8").splitlines()
-    assert best_lines[0] == "repeat_id,method,stage,epoch,include_outcome,mse_x,mse_y,mse_v,structural_mse"
-    assert any(",map," in line for line in best_lines[1:])
-
-    combo_md_text = combo_md.read_text(encoding="utf-8")
-    assert "## Demand-design sweep run [2/8]: n_samples=1000, rho=0.25, repeat=1" in combo_md_text
-    assert "Demand-design run config:" in combo_md_text
-    assert "Observed data ranges before normalization:" in combo_md_text
-    assert "Training metric history" in combo_md_text
-    assert "Best structural checkpoint [map]" in combo_md_text
-    assert "Last logged structural checkpoint [map]" in combo_md_text
+    lines = (combo_dir / "results.csv").read_text(encoding="utf-8").splitlines()
+    assert lines[0] == "repeat_id,method,stage,epoch,include_outcome,mse_x,mse_y,mse_v,structural_mse"
+    assert lines[1] == "1,map,epoch_eval,10,True,0.2,0.1,0.05,8.0"
 
 
 def test_render_demand_design_active_window_omits_updated_at_and_run_id(tmp_path):

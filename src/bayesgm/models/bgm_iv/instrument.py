@@ -221,24 +221,6 @@ class BGM_IV(CausalBGM):
             )
         return target_x.astype(np.float32)
 
-    def _snapshot_trainable_state(self):
-        """Capture the trainable network weights for later restoration."""
-        return {
-            "g_net": self.g_net.get_weights(),
-            "e_net": self.e_net.get_weights(),
-            "f_net": self.f_net.get_weights(),
-            "h_net": self.h_net.get_weights(),
-            "dz_net": self.dz_net.get_weights(),
-        }
-
-    def _restore_trainable_state(self, state):
-        """Restore a previously captured network-weight snapshot."""
-        self.g_net.set_weights(state["g_net"])
-        self.e_net.set_weights(state["e_net"])
-        self.f_net.set_weights(state["f_net"])
-        self.h_net.set_weights(state["h_net"])
-        self.dz_net.set_weights(state["dz_net"])
-
     def _coerce_metric_value(self, value):
         if isinstance(value, tf.Tensor):
             value = value.numpy()
@@ -1056,13 +1038,6 @@ class BGM_IV(CausalBGM):
 
         self.data_z = tf.Variable(data_z_init, name="Latent Variable", trainable=True)
 
-        best_loss = np.inf
-        best_state = None
-        best_record = None
-        selection_metric = str(
-            self.params.get("fit_model_selection_metric", "structural_mse")
-        ).strip()
-        restore_best_weights = bool(self.params.get("fit_restore_best_weights", True))
         show_batch_progress = bool(self.params.get("fit_use_progress_bar", False)) and bool(verbose)
         print("Iterative Updating Starts ...")
         for epoch in range(epochs + 1):
@@ -1146,21 +1121,7 @@ class BGM_IV(CausalBGM):
                         % (epoch, epochs, self._format_training_record(record))
                     )
 
-                metric_name = selection_metric if selection_metric in record else "mse_y"
-                metric_value = float(record[metric_name])
-
-                if (
-                    include_outcome
-                    and epoch >= startoff
-                    and metric_value < best_loss
-                ):
-                    best_loss = metric_value
-                    best_state = self._snapshot_trainable_state()
-                    best_record = dict(record)
-                    self.best_causal_pre = causal_pre
-                    self.best_epoch = epoch
-                    self.best_metric_name = metric_name
-                    self.best_metric_value = metric_value
+                if include_outcome and epoch >= startoff:
                     if self.params["save_model"]:
                         ckpt_save_path = self.ckpt_manager.save(epoch)
                         print(
@@ -1176,19 +1137,6 @@ class BGM_IV(CausalBGM):
                         ),
                         causal_pre,
                     )
-        self.best_training_record = best_record
-        if restore_best_weights and best_state is not None:
-            self._restore_trainable_state(best_state)
-            if hasattr(self, "data_z"):
-                self.data_z.assign(self.e_net(data_v))
-            print(
-                "Restored best weights from epoch %d using %s=%.6f"
-                % (
-                    int(best_record["epoch"]),
-                    self.best_metric_name,
-                    self.best_metric_value,
-                )
-            )
         return self.training_history
 
     @tf.function

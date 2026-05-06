@@ -312,14 +312,6 @@ def test_mnist_runner_helpers_use_mnist_slug():
     assert "image_seed: 42" in text
     assert "noise_seed: 99" in text
     assert (
-        main_module._build_training_history_repeat_csv_name(params)
-        == "training_metric_history_sim_demand_design_mnist_iv_n1000_rho0p5_repeat1.csv"
-    )
-    assert (
-        main_module._build_training_history_combo_md_name(params)
-        == "training_metric_history_sim_demand_design_mnist_iv_n1000_rho0p5.md"
-    )
-    assert (
         main_module._demand_design_active_window_path(params).name
         == "outputs_dev_sim_demand_design_mnist_iv_active.md"
     )
