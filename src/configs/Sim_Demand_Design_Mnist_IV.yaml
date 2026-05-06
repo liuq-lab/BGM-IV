@@ -1,0 +1,45 @@
+# General parameters
+dataset: Sim_Demand_Design_Mnist_IV
+output_dir: "."
+save_res: False
+save_model: False
+use_gpu: True
+binary_treatment: False
+use_bnn: False
+n_samples: [5000]
+rho: [0.1,0.25,0.5,0.75,0.9]
+n_repeat: 5
+fit_epochs: 200
+fit_epochs_per_eval: 10
+fit_batch_size: 32
+fit_egm_n_iter: 30000
+fit_egm_batches_per_eval: 500
+fit_first_stage_warmup_epochs: 0
+
+# Model parameters
+z_dims: [2,1,1,7]
+# v_dim=785 is the raw MNIST setting: [time, image_784].
+# v_dim>785 appends Gaussian nuisance covariates after the image block.
+# For example, v_dim=1000 uses 215 nuisance dimensions.
+v_dim: 1000
+lr_theta: 0.0001
+lr_z: 0.0001
+g_units: [64,64,64,64,64]
+f_units: [64,32,8]
+h_units: [64,32,8]
+e_units: [64,64,64,64,64]
+dz_units: [64,32,8]
+kl_weight: 0.0001
+latent_pzv_weight: 1
+
+# EGM initialization
+lr: 0.0002
+g_d_freq: 5
+use_z_rec: True
+
+# IV Monte Carlo settings
+iv_mc_samples: 1000
+eval_mc_samples: 1000
+
+structural_map_steps: 1000
+structural_map_lr: 0.0001

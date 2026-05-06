@@ -1,0 +1,23 @@
+# OS and editor noise
+.DS_Store
+
+# Python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+
+# Runtime outputs
+src/logs/
+src/dumps/
+src/sweeps/
+src/data/
+src/checkpoints/
+src/results/
+sweeps/
+checkpoints/
+results/
+
+# Local smoke-test and monitoring workspaces
+.codex-sandboxes/
+.codex-monitor/
