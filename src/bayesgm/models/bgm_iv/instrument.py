@@ -11,11 +11,11 @@ from bayesgm.datasets import Gaussian_sampler
 from bayesgm.utils.data_io import save_data
 
 from ..networks import BaseFullyConnectedNet, BayesianFullyConnectedNet, Discriminator
-from .base import BGMBase
+from .base import CausalBGM
 
 
-class BGM_IV(BGMBase):
-    """Instrumental-variable extension of :class:`BGMBase`.
+class BGM_IV(CausalBGM):
+    """Instrumental-variable extension of :class:`CausalBGM`.
 
     The observed tuple is ``(X, Y, V, W)`` where ``W`` denotes instrumental
     variables. The model treats ``W`` as fixed observed variables and learns
@@ -1020,7 +1020,7 @@ class BGM_IV(BGMBase):
             ``(n,1)``, ``(n,1)``, ``(n,v_dim)``, and ``(n,w_dim)``.
         epochs, epochs_per_eval, batch_size, startoff, use_egm_init,
         egm_n_iter, egm_batches_per_eval, save_format, verbose :
-            Same meanings as in :class:`BGMBase`.
+            Same meanings as in :class:`CausalBGM`.
         first_stage_warmup_epochs : int or None, optional
             Number of epochs to train only ``p(v|z)`` and ``p(x|w,z)`` before
             switching on the IV outcome pseudo-likelihood.
