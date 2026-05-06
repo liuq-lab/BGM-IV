@@ -1,18 +1,18 @@
 # General parameters
 dataset: Sim_Demand_Design_IV
 output_dir: "."
-save_res: True
-save_model: True
+save_res: False
+save_model: False
 use_gpu: False
 binary_treatment: False
-use_bnn: True
-n_samples: [5000,10000]
-rho: [0.1]
-n_repeat: 5
+use_bnn: False
+n_samples: [1000,5000,10000]
+rho: [0.1,0.25,0.5,0.75,0.9]
+n_repeat: 20
 normalize_before_training: True
 fit_epochs: 200
 fit_epochs_per_eval: 10
-fit_batch_size: 32
+fit_batch_size: 64
 fit_egm_n_iter: 50000
 fit_egm_batches_per_eval: 500
 fit_first_stage_warmup_epochs: 0
@@ -29,7 +29,7 @@ dz_units: [64,32,8]
 kl_weight: 0.0001
 # Training-stage weight on the p(z|v) loss block (loss_pv_z + loss_prior_z).
 # This does not affect test-time MAP, which uses the untempered posterior.
-latent_pzv_weight: 1
+latent_pzv_weight: 0.5
 
 # EGM initialization
 lr: 0.0002
