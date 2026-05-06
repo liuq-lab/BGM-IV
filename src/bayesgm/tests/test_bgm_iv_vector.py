@@ -8,7 +8,7 @@ from bayesgm.datasets import (
     simulate_demand_design_iv,
     simulate_demand_design_vector_iv,
 )
-from bayesgm.models.causalbgm import CausalBGM_IV_Vector
+from bayesgm.models.bgm_iv import BGM_IV_Vector
 from bayesgm.models.networks import DemandVectorFeatureExtractor
 
 
@@ -93,8 +93,8 @@ def test_vector_feature_extractor_output_shape():
     assert features.shape == (2, 65)
 
 
-def test_causalbgm_iv_vector_accepts_v_dim(tmp_path):
-    model = CausalBGM_IV_Vector(params=_make_vector_params(tmp_path), random_seed=13)
+def test_bgm_iv_vector_accepts_v_dim(tmp_path):
+    model = BGM_IV_Vector(params=_make_vector_params(tmp_path), random_seed=13)
 
     data_v = tf.zeros((2, 785), dtype=tf.float32)
     data_z = model.e_net(data_v, training=False)
@@ -110,11 +110,11 @@ def test_vector_model_rejects_alpha_v(tmp_path):
     params["alpha_v"] = 1.0
 
     with pytest.raises(ValueError, match="alpha_v"):
-        CausalBGM_IV_Vector(params=params, random_seed=13)
+        BGM_IV_Vector(params=params, random_seed=13)
 
 
 def test_vector_covariate_posterior_is_untempered(tmp_path):
-    model = CausalBGM_IV_Vector(params=_make_vector_params(tmp_path), random_seed=13)
+    model = BGM_IV_Vector(params=_make_vector_params(tmp_path), random_seed=13)
     data_v = tf.zeros((2, 785), dtype=tf.float32)
     data_z = tf.constant(
         [[0.1, -0.2, 0.3, -0.4], [0.5, 0.1, -0.3, 0.2]],

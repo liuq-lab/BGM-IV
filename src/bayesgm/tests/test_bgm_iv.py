@@ -11,7 +11,7 @@ from bayesgm.datasets import (
     make_demand_design_grid,
     simulate_demand_design_iv,
 )
-from bayesgm.models.causalbgm import CausalBGM_IV
+from bayesgm.models.bgm_iv import BGM_IV
 
 tf.config.threading.set_intra_op_parallelism_threads(1)
 tf.config.threading.set_inter_op_parallelism_threads(1)
@@ -101,11 +101,11 @@ def test_demand_design_covariates_are_low_dimensional():
     assert grid["v"].shape == (3 * 2 * 7, 2)
 
 
-def test_causalbgm_iv_smoke(tmp_path):
+def test_bgm_iv_smoke(tmp_path):
     train = simulate_demand_design_iv(n_samples=96, rho=0.5, seed=7)
     params = _make_params(tmp_path)
 
-    model = CausalBGM_IV(params=params, random_seed=13)
+    model = BGM_IV(params=params, random_seed=13)
     model.fit(
         data=(train["x"], train["y"], train["v"], train["w"]),
         epochs=2,
@@ -145,7 +145,7 @@ def test_causalbgm_iv_smoke(tmp_path):
 
 def test_covariate_posterior_is_untempered(tmp_path):
     params = _make_params(tmp_path)
-    model = CausalBGM_IV(params=params, random_seed=3)
+    model = BGM_IV(params=params, random_seed=3)
 
     data_v = tf.constant([[0.2, -0.1], [0.4, 0.7]], dtype=tf.float32)
     data_z = tf.constant(
@@ -165,21 +165,21 @@ def test_covariate_posterior_is_untempered(tmp_path):
     np.testing.assert_allclose(actual.numpy(), expected.numpy(), rtol=1e-6, atol=1e-6)
 
 
-def test_causalbgm_iv_rejects_alpha_v_param(tmp_path):
+def test_bgm_iv_rejects_alpha_v_param(tmp_path):
     params = _make_params(tmp_path)
     params["alpha_v"] = 1.0
 
     with pytest.raises(ValueError, match="alpha_v"):
-        CausalBGM_IV(params=params, random_seed=3)
+        BGM_IV(params=params, random_seed=3)
 
 
-def test_causalbgm_iv_records_structural_history(tmp_path):
+def test_bgm_iv_records_structural_history(tmp_path):
     train = simulate_demand_design_iv(n_samples=64, rho=0.5, seed=11)
     grid = make_demand_design_grid(price_points=3, time_points=2)
     params = _make_params(tmp_path)
     params["use_bnn"] = False
 
-    model = CausalBGM_IV(params=params, random_seed=13)
+    model = BGM_IV(params=params, random_seed=13)
 
     def callback(model, stage, epoch, metrics):
         return {

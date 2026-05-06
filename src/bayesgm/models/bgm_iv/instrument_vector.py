@@ -1,33 +1,35 @@
 import tensorflow as tf
 import tensorflow_probability as tfp
 
-from .instrument import CausalBGM_IV
-from ..networks import DemandImageCovariateDecoder, DemandImageEncoder
+from .instrument import BGM_IV
+from ..networks import DemandVectorCovariateDecoder, DemandVectorEncoder
 
 
-class CausalBGM_IV_Image(CausalBGM_IV):
-    """Image-aware IV model for the MNIST demand-design benchmark."""
+class BGM_IV_Vector(BGM_IV):
+    """Vector-aware IV model for the demand-design proxy benchmark."""
 
     def __init__(self, params, timestamp=None, random_seed=None):
         params = dict(params)
-        if int(params.get("v_dim", 0)) < 785:
-            raise ValueError("`CausalBGM_IV_Image` requires `v_dim >= 785`.")
+        self.vector_dim = int(params.get("vector_dim", 784))
+        if int(params.get("v_dim", 0)) != 1 + self.vector_dim:
+            raise ValueError("`BGM_IV_Vector` requires `v_dim == 1 + vector_dim`.")
         if int(params.get("w_dim", 0)) != 1:
-            raise ValueError("`CausalBGM_IV_Image` requires `w_dim == 1`.")
+            raise ValueError("`BGM_IV_Vector` requires `w_dim == 1`.")
 
         super().__init__(params=params, timestamp=timestamp, random_seed=random_seed)
 
         z_dim = sum(self.params["z_dims"])
-        self.image_dim = 28 * 28
-        self.extra_noise_dim = int(self.params["v_dim"]) - 1 - self.image_dim
-        self.e_net = DemandImageEncoder(
+        self.vector_dim = int(self.params.get("vector_dim", 784))
+        self.e_net = DemandVectorEncoder(
             z_dim=z_dim,
             v_dim=self.params["v_dim"],
+            vector_dim=self.vector_dim,
             name="e_net",
         )
-        self.g_net = DemandImageCovariateDecoder(
+        self.g_net = DemandVectorCovariateDecoder(
             z_dim=z_dim,
             v_dim=self.params["v_dim"],
+            vector_dim=self.vector_dim,
             name="g_net",
         )
         self.initialize_nets()
@@ -70,68 +72,45 @@ class CausalBGM_IV_Image(CausalBGM_IV):
             print(self.f_net.summary())
             print(self.h_net.summary())
 
-    @staticmethod
-    def _split_public_covariates(data_v):
+    def _split_public_covariates(self, data_v):
         data_v = tf.cast(data_v, tf.float32)
         time = data_v[:, :1]
-        image_raw = data_v[:, 1:785]
-        noise = data_v[:, 785:]
-        image_norm = image_raw / 255.0
-        return time, image_raw, image_norm, noise
+        vector = data_v[:, 1 : 1 + self.vector_dim]
+        return time, vector
 
     def _decode_covariates(self, data_z, training=True):
         return self.g_net(data_z, training=training)
 
     def _covariate_loss_terms(self, data_v, data_z, training=True):
-        time_obs, _, image_obs, noise_obs = self._split_public_covariates(data_v)
+        time_obs, vector_obs = self._split_public_covariates(data_v)
         decoded = self._decode_covariates(data_z, training=training)
 
         time_mean = decoded["time_mean"]
         time_var = decoded["time_var"]
-        image_logits = decoded["image_logits"]
-        image_probs = decoded["image_probs"]
-        noise_mean = decoded["noise_mean"]
-        noise_var = decoded["noise_var"]
+        vector_mean = decoded["vector_mean"]
+        vector_var = decoded["vector_var"]
 
         time_nll = tf.squeeze(
             ((time_obs - time_mean) ** 2) / (2.0 * time_var)
             + 0.5 * tf.math.log(time_var),
             axis=1,
         )
-        image_nll = tf.reduce_mean(
-            tf.nn.sigmoid_cross_entropy_with_logits(
-                labels=image_obs,
-                logits=image_logits,
-            ),
+        vector_nll = tf.reduce_mean(
+            ((vector_obs - vector_mean) ** 2) / (2.0 * vector_var)
+            + 0.5 * tf.math.log(vector_var),
             axis=1,
         )
         mse_time = tf.reduce_mean((time_obs - time_mean) ** 2)
-        mse_image = tf.reduce_mean((image_obs - image_probs) ** 2)
-        loss_terms = [time_nll, image_nll]
-        mse_terms = [mse_time, mse_image]
-        if self.extra_noise_dim > 0:
-            noise_nll = tf.reduce_mean(
-                ((noise_obs - noise_mean) ** 2) / (2.0 * noise_var)
-                + 0.5 * tf.math.log(noise_var),
-                axis=1,
-            )
-            mse_noise = tf.reduce_mean((noise_obs - noise_mean) ** 2)
-            loss_terms.append(noise_nll)
-            mse_terms.append(mse_noise)
-        mse_v = tf.add_n(mse_terms) / float(len(mse_terms))
-        return tf.add_n(loss_terms), mse_v, decoded
+        mse_vector = tf.reduce_mean((vector_obs - vector_mean) ** 2)
+        mse_v = (mse_time + mse_vector) / 2.0
+        return time_nll + vector_nll, mse_v, decoded
 
     def _covariate_cycle_mse(self, observed_v, reconstructed_v):
-        observed_time, _, observed_image, observed_noise = self._split_public_covariates(observed_v)
-        reconstructed_time, _, reconstructed_image, reconstructed_noise = self._split_public_covariates(
-            reconstructed_v
-        )
+        observed_time, observed_vector = self._split_public_covariates(observed_v)
+        reconstructed_time, reconstructed_vector = self._split_public_covariates(reconstructed_v)
         mse_time = tf.reduce_mean((observed_time - reconstructed_time) ** 2)
-        mse_image = tf.reduce_mean((observed_image - reconstructed_image) ** 2)
-        mse_terms = [mse_time, mse_image]
-        if self.extra_noise_dim > 0:
-            mse_terms.append(tf.reduce_mean((observed_noise - reconstructed_noise) ** 2))
-        return tf.add_n(mse_terms) / float(len(mse_terms))
+        mse_vector = tf.reduce_mean((observed_vector - reconstructed_vector) ** 2)
+        return (mse_time + mse_vector) / 2.0
 
     @tf.function
     def update_g_net(self, data_z, data_v, eps=1e-6):
@@ -213,9 +192,10 @@ class CausalBGM_IV_Image(CausalBGM_IV):
             l2_loss_v = self._covariate_cycle_mse(data_v, data_v__)
             l2_loss_z = tf.reduce_mean((data_z - data_z__) ** 2)
             e_loss_adv = -tf.reduce_mean(data_dz_)
-            sigma_square_loss = tf.reduce_mean(tf.square(decoded["time_var"]))
-            if self.extra_noise_dim > 0:
-                sigma_square_loss += tf.reduce_mean(tf.square(decoded["noise_var"]))
+            sigma_square_loss = (
+                tf.reduce_mean(tf.square(decoded["time_var"]))
+                + tf.reduce_mean(tf.square(decoded["vector_var"]))
+            )
 
             h_output = self.h_net(tf.concat([data_z0, data_z2, data_w], axis=-1))
             data_x_ = h_output[:, :1]

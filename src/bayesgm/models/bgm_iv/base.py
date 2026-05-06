@@ -9,14 +9,13 @@ import datetime
 import os
 from tqdm import tqdm
 
-class CausalBGM(object):
-    """Causal Bayesian Generative Model (CausalBGM) for causal inference.
+class BGMBase(object):
+    """Base latent-variable Bayesian generative model for causal inference.
 
-    CausalBGM learns a latent-variable generative model for causal inference
-    with treatment :math:`X`, outcome :math:`Y`, and high-dimensional covariates
-    :math:`V`.  The latent variable :math:`Z` is partitioned into
-    :math:`(Z_0, Z_1, Z_2, Z_3)` to disentangle confounding, outcome-specific,
-    treatment-specific, and residual variation.
+    BGMBase learns with treatment :math:`X`, outcome :math:`Y`, and
+    high-dimensional covariates :math:`V`. The latent variable :math:`Z` is
+    partitioned into :math:`(Z_0, Z_1, Z_2, Z_3)` to disentangle confounding,
+    outcome-specific, treatment-specific, and residual variation.
 
     Parameters
     ----------
@@ -54,7 +53,7 @@ class CausalBGM(object):
     """
 
     def __init__(self, params, timestamp=None, random_seed=None):
-        super(CausalBGM, self).__init__()
+        super(BGMBase, self).__init__()
         self.params = params
         self.timestamp = timestamp
         if random_seed is not None:
@@ -128,7 +127,7 @@ class CausalBGM(object):
             print ('Latest checkpoint restored!!') 
 
     def get_config(self):
-        """Return the configuration of the CausalBGM model.
+        """Return the configuration of the BGMBase model.
 
         Returns
         -------
@@ -142,7 +141,7 @@ class CausalBGM(object):
         }
 
     def initialize_nets(self, print_summary = False):
-        """Initialize all the networks in CausalBGM."""
+        """Initialize all the networks in BGMBase."""
 
         self.g_net(np.zeros((1, sum(self.params['z_dims']))))
         self.f_net(np.zeros((1, self.params['z_dims'][0]+self.params['z_dims'][1]+1)))
@@ -433,7 +432,7 @@ class CausalBGM(object):
 
     def fit(self, data, epochs=100, epochs_per_eval=5, batch_size=32, startoff=0, use_egm_init=True, 
             egm_n_iter=30000, egm_batches_per_eval=500, save_format='txt', verbose=1):
-        """Train CausalBGM with an optional EGM warm-start.
+        """Train BGMBase with an optional EGM warm-start.
 
         Parameters
         ----------
@@ -568,4 +567,3 @@ class CausalBGM(object):
             dose_response = tf.map_fn(compute_dose_response, x_values, fn_output_signature=tf.float32)
             
             return dose_response, mse_x, mse_y, mse_v
-

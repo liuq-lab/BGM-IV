@@ -2,13 +2,13 @@ import setuptools
 
 
 setuptools.setup(
-    name="causalbgm-iv",
+    name="bgm-iv",
     version="0.1.0",
     author="Qiao Liu",
     author_email="qiao.liu@yale.edu",
-    description="Minimal CausalBGM-IV package for demand-design IV experiments.",
+    description="Minimal BGM-IV package for demand-design IV experiments.",
     long_description=(
-        "A clean research package containing the CausalBGM-IV implementation "
+        "A clean research package containing the BGM-IV implementation "
         "and the three demand-design IV experiment configurations used for "
         "the NeurIPS 2026 submission."
     ),

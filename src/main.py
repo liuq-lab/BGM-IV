@@ -17,9 +17,9 @@ import traceback
 from itertools import product
 import yaml
 from bayesgm.models import (
-    CausalBGM_IV,
-    CausalBGM_IV_Image,
-    CausalBGM_IV_Vector,
+    BGM_IV,
+    BGM_IV_Image,
+    BGM_IV_Vector,
 )
 from bayesgm.datasets import (
     simulate_demand_design_iv,
@@ -99,7 +99,7 @@ def _build_arg_parser():
         "--config",
         required=True,
         type=str,
-        help="Path to one of the supported CausalBGM-IV config files.",
+        help="Path to one of the supported BGM-IV config files.",
     )
     parser.add_argument(
         '-t',
@@ -1024,11 +1024,11 @@ def _print_training_history(history):
 
 def _fit_demand_design_model(params, train, evaluation_callback=None):
     if params["dataset"] == "Sim_Demand_Design_Mnist_IV":
-        model_cls = CausalBGM_IV_Image
+        model_cls = BGM_IV_Image
     elif params["dataset"] == "Sim_Demand_Design_Vector_IV":
-        model_cls = CausalBGM_IV_Vector
+        model_cls = BGM_IV_Vector
     else:
-        model_cls = CausalBGM_IV
+        model_cls = BGM_IV
     model = model_cls(params=params, random_seed=None)
     model.fit(
         data=(train["x"], train["y"], train["v"], train["w"]),

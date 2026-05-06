@@ -11,11 +11,11 @@ from bayesgm.datasets import Gaussian_sampler
 from bayesgm.utils.data_io import save_data
 
 from ..networks import BaseFullyConnectedNet, BayesianFullyConnectedNet, Discriminator
-from .base import CausalBGM
+from .base import BGMBase
 
 
-class CausalBGM_IV(CausalBGM):
-    """Instrumental-variable extension of :class:`CausalBGM`.
+class BGM_IV(BGMBase):
+    """Instrumental-variable extension of :class:`BGMBase`.
 
     The observed tuple is ``(X, Y, V, W)`` where ``W`` denotes instrumental
     variables. The model treats ``W`` as fixed observed variables and learns
@@ -34,7 +34,7 @@ class CausalBGM_IV(CausalBGM):
 
     def __init__(self, params, timestamp=None, random_seed=None):
         if "w_dim" not in params:
-            raise KeyError("`w_dim` must be provided in params for CausalBGM_IV.")
+            raise KeyError("`w_dim` must be provided in params for BGM_IV.")
         if "alpha_v" in params:
             raise ValueError(
                 "`alpha_v` is no longer supported; test-time MAP uses the "
@@ -165,7 +165,7 @@ class CausalBGM_IV(CausalBGM):
     def _parse_train_data(self, data):
         if len(data) != 4:
             raise ValueError(
-                "CausalBGM_IV.fit/evaluate expect data=(x, y, v, w)."
+                "BGM_IV.fit/evaluate expect data=(x, y, v, w)."
             )
         data_x, data_y, data_v, data_w = data
         data_x = self._to_2d_float32(data_x)
@@ -191,7 +191,7 @@ class CausalBGM_IV(CausalBGM):
             data_y = self._to_2d_float32(data_y)
         else:
             raise ValueError(
-                "CausalBGM_IV.predict expects data=(x, v, w) or data=(x, y, v, w)."
+                "BGM_IV.predict expects data=(x, v, w) or data=(x, y, v, w)."
             )
         data_x = self._to_2d_float32(data_x)
         data_v = self._to_2d_float32(data_v)
@@ -1011,7 +1011,7 @@ class CausalBGM_IV(CausalBGM):
         first_stage_warmup_epochs=None,
         evaluation_callback=None,
     ):
-        """Train ``CausalBGM_IV`` on observed data ``(x, y, v, w)``.
+        """Train ``BGM_IV`` on observed data ``(x, y, v, w)``.
 
         Parameters
         ----------
@@ -1020,7 +1020,7 @@ class CausalBGM_IV(CausalBGM):
             ``(n,1)``, ``(n,1)``, ``(n,v_dim)``, and ``(n,w_dim)``.
         epochs, epochs_per_eval, batch_size, startoff, use_egm_init,
         egm_n_iter, egm_batches_per_eval, save_format, verbose :
-            Same meanings as in :class:`CausalBGM`.
+            Same meanings as in :class:`BGMBase`.
         first_stage_warmup_epochs : int or None, optional
             Number of epochs to train only ``p(v|z)`` and ``p(x|w,z)`` before
             switching on the IV outcome pseudo-likelihood.

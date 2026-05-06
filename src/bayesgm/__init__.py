@@ -5,16 +5,16 @@ __version__ = "1.0.2"
 
 if TYPE_CHECKING:
     from . import datasets, models, utils
-    from .models.causalbgm import (
-        CausalBGM_IV,
-        CausalBGM_IV_Image,
-        CausalBGM_IV_Vector,
+    from .models.bgm_iv import (
+        BGM_IV,
+        BGM_IV_Image,
+        BGM_IV_Vector,
     )
 
 _SYMBOL_TO_MODULE = {
-    "CausalBGM_IV": "bayesgm.models.causalbgm",
-    "CausalBGM_IV_Image": "bayesgm.models.causalbgm",
-    "CausalBGM_IV_Vector": "bayesgm.models.causalbgm",
+    "BGM_IV": "bayesgm.models.bgm_iv",
+    "BGM_IV_Image": "bayesgm.models.bgm_iv",
+    "BGM_IV_Vector": "bayesgm.models.bgm_iv",
 }
 
 _MODULE_ATTRIBUTES = {
@@ -24,9 +24,9 @@ _MODULE_ATTRIBUTES = {
 }
 
 __all__ = [
-    "CausalBGM_IV",
-    "CausalBGM_IV_Image",
-    "CausalBGM_IV_Vector",
+    "BGM_IV",
+    "BGM_IV_Image",
+    "BGM_IV_Vector",
 ]
 
 

@@ -10,7 +10,7 @@ from bayesgm.datasets.simulator_image import (
     make_demand_design_mnist_grid,
     simulate_demand_design_mnist_iv,
 )
-from bayesgm.models.causalbgm import CausalBGM_IV_Image
+from bayesgm.models.bgm_iv import BGM_IV_Image
 from bayesgm.models.networks import DemandImageFeatureExtractor
 import bayesgm.datasets.simulator_image as simulator_image_module
 
@@ -208,10 +208,10 @@ def test_image_feature_extractor_splits_image_and_noise_blocks():
     assert features.shape == (2, 97)
 
 
-def test_causalbgm_iv_image_accepts_mnist_hd_v_dim(tmp_path):
+def test_bgm_iv_image_accepts_mnist_hd_v_dim(tmp_path):
     params = _make_image_params(tmp_path)
     params["v_dim"] = 1000
-    model = CausalBGM_IV_Image(params=params, random_seed=13)
+    model = BGM_IV_Image(params=params, random_seed=13)
 
     data_v = tf.zeros((2, 1000), dtype=tf.float32)
     data_z = model.e_net(data_v, training=False)
@@ -223,13 +223,13 @@ def test_causalbgm_iv_image_accepts_mnist_hd_v_dim(tmp_path):
     assert decoded["noise_mean"].shape == (2, 215)
 
 
-def test_causalbgm_iv_image_smoke(fake_mnist, tmp_path):
+def test_bgm_iv_image_smoke(fake_mnist, tmp_path):
     train = simulate_demand_design_mnist_iv(n_samples=24, rho=0.5, seed=3, v_dim=785)
     grid = make_demand_design_mnist_grid(price_points=3, time_points=2, v_dim=785, image_seed=42)
     train_std, grid_std, stats = main_module._standardize_demand_design_image_data(train, grid)
 
     params = _make_image_params(tmp_path)
-    model = CausalBGM_IV_Image(params=params, random_seed=13)
+    model = BGM_IV_Image(params=params, random_seed=13)
     model.fit(
         data=(train_std["x"], train_std["y"], train_std["v"], train_std["w"]),
         epochs=1,
@@ -270,7 +270,7 @@ def test_image_model_rejects_alpha_v(fake_mnist, tmp_path):
     params["alpha_v"] = 1.0
 
     with pytest.raises(ValueError, match="alpha_v"):
-        CausalBGM_IV_Image(params=params, random_seed=3)
+        BGM_IV_Image(params=params, random_seed=3)
 
 
 def test_image_covariate_posterior_is_untempered(fake_mnist, tmp_path):
@@ -281,7 +281,7 @@ def test_image_covariate_posterior_is_untempered(fake_mnist, tmp_path):
     )
 
     params = _make_image_params(tmp_path)
-    model = CausalBGM_IV_Image(params=params, random_seed=5)
+    model = BGM_IV_Image(params=params, random_seed=5)
 
     loss_pv_z, _, _ = model._covariate_loss_terms(data_v, data_z, training=False)
     loss_prior_z = tf.reduce_sum(data_z ** 2, axis=1) / 2.0

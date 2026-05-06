@@ -1,6 +1,6 @@
-# CausalBGM-IV
+# BGM-IV
 
-This repository is the minimal CausalBGM-IV package for the demand-design
+This repository is the minimal BGM-IV package for the demand-design
 instrumental-variable experiments.
 
 It keeps only the code needed to run:
@@ -10,7 +10,7 @@ It keeps only the code needed to run:
 - `Sim_Demand_Design_Vector_IV`
 
 The Python namespace remains `bayesgm`, but the public model API is limited to
-`CausalBGM_IV`, `CausalBGM_IV_Image`, and `CausalBGM_IV_Vector`.
+`BGM_IV`, `BGM_IV_Image`, and `BGM_IV_Vector`.
 
 The paper experiment entrypoint is MAP-only for structural evaluation. MAP is
 the default when structural method fields are omitted, and other structural
