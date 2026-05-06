@@ -2,30 +2,18 @@
 
 Bayesian generative modeling for nonlinear instrumental-variable regression.
 
-BGM-IV is a latent Bayesian generative modeling approach for IV regression under
-endogenous treatment assignment. The method learns a causally structured latent
-space for observed covariates, treatment, and outcome, then uses an
-IV-integrated pseudo-likelihood so outcome learning is driven by
-instrument-induced treatment variation rather than the observed endogenous
-treatment alone.
-
-This repository is the minimal research package for the demand-design IV
-experiments used in the BGM-IV paper. It keeps only the code needed for the
-low-dimensional demand benchmark and the high-dimensional vector and MNIST
-covariate benchmarks.
+BGM-IV is a Bayesian generative modeling package for nonlinear
+instrumental-variable regression with high-dimensional covariates. It jointly
+models covariates, treatment, outcome, and instrument-induced treatment
+variation through a structured latent generative model, enabling structural
+prediction under endogenous treatment assignment.
 
 ## Highlights
 
-- Latent Bayesian generative modeling for nonlinear IV regression
-- Structured latent components for shared confounding, outcome variation,
-  treatment variation, and covariate-only nuisance information
-- IV-integrated pseudo-likelihood for learning from instrument-induced
-  treatment variation
-- MAP structural prediction for paper experiments
-- Reproducible demand-design benchmarks with fixed data-generation and
-  evaluation-grid defaults
-- Support for low-dimensional demand, vector-proxy demand, MNIST image
-  covariates, and an MNIST-HD appendix variant
+- Nonlinear instrumental-variable regression under endogeneity
+- Latent Bayesian generative modeling for structured covariate representations
+- IV-integrated pseudo-likelihood for endogeneity correction
+- MAP structural prediction for fast point estimates
 
 ## Installation
 
@@ -61,50 +49,56 @@ expected compatible runtime libraries.
 
 ## Quickstart (Python API)
 
-The public Python API remains under the `bayesgm` namespace. The primary model
-classes are `BGM_IV`, `BGM_IV_Image`, and `BGM_IV_Vector`.
+Below is a minimal example that mirrors the main workflow: load a configuration,
+simulate demand-design IV data, train BGM-IV, and evaluate MAP structural
+predictions. Run it from `src/`. The example uses the real
+`Sim_Demand_Design_IV` configuration and only overrides runtime settings so the
+demo finishes quickly.
 
 ```python
 import numpy as np
+import yaml
 
 from bayesgm.datasets import make_demand_design_grid, simulate_demand_design_iv
 from bayesgm.models import BGM_IV
 
-train = simulate_demand_design_iv(n_samples=128, rho=0.5, seed=0)
-grid = make_demand_design_grid(price_points=4, time_points=3)
+# Load the low-dimensional demand-design configuration
+params = yaml.safe_load(open("configs/Sim_Demand_Design_IV.yaml", "r"))
 
-params = {
-    "dataset": "DemandDesignQuickstart",
-    "output_dir": ".",
-    "save_res": False,
-    "save_model": False,
-    "binary_treatment": False,
-    "use_bnn": False,
-    "z_dims": [1, 1, 1, 1],
-    "v_dim": 2,
-    "w_dim": 1,
-    "lr_theta": 5e-4,
-    "lr_z": 5e-4,
-    "g_units": [16, 16],
-    "e_units": [16, 16],
-    "f_units": [16, 8],
-    "h_units": [16, 8],
-    "dz_units": [16, 8],
-    "kl_weight": 0.0,
-    "lr": 5e-4,
-    "g_d_freq": 1,
-    "use_z_rec": True,
-    "iv_mc_samples": 4,
-    "eval_mc_samples": 4,
-    "structural_map_steps": 5,
-}
+# Small demo overrides so the example runs quickly
+params.update(
+    {
+        "output_dir": ".",
+        "save_res": False,
+        "save_model": False,
+        "use_bnn": False,
+        "n_samples": 128,
+        "rho": 0.5,
+        "n_repeat": 1,
+        "fit_epochs": 1,
+        "fit_egm_n_iter": 0,
+        "fit_batch_size": 32,
+        "iv_mc_samples": 4,
+        "eval_mc_samples": 4,
+        "structural_map_steps": 5,
+        "v_dim": 2,
+        "w_dim": 1,
+        "seed": 0,
+    }
+)
+
+train = simulate_demand_design_iv(
+    n_samples=params["n_samples"],
+    rho=params["rho"],
+    seed=params["seed"],
+)
+grid = make_demand_design_grid(price_points=4, time_points=3)
 
 model = BGM_IV(params=params, random_seed=42)
 model.fit(
     data=(train["x"], train["y"], train["v"], train["w"]),
-    epochs=1,
-    epochs_per_eval=1,
-    batch_size=32,
+    epochs=params["fit_epochs"],
+    batch_size=params["fit_batch_size"],
     use_egm_init=False,
     verbose=0,
 )
@@ -113,13 +107,16 @@ prediction = model.predict_structural(
     grid["x"],
     grid["v"],
     latent_method="map",
-    map_steps=5,
+    map_steps=params["structural_map_steps"],
 )
 mse = np.mean((prediction - grid["y_struct"]) ** 2)
 print(f"Structural MSE: {mse:.4f}")
 ```
 
 ## Reproducing Experiments With `main.py`
+
+`main.py` is the primary experiment entrypoint. It reads a YAML configuration
+with `-c` and runs the requested demand-design IV benchmark.
 
 Run all commands from `src/`:
 
@@ -141,16 +138,12 @@ Use `-t x` to set the number of parallel workers for demand-design sweeps.
   benchmark with a 784-dimensional proxy representation and
   `representation_sd: 0.5`.
 
-The MNIST-HD appendix variant uses the MNIST config with `v_dim: 1000`, which
+For MNIST-HD, set `v_dim: 1000` in the MNIST config or in a copied config. This
 appends 215 iid Gaussian nuisance covariates after `[time, image_784]`.
-
-The paper experiment entrypoint is MAP-only for structural evaluation. MAP is
-the default when structural method fields are omitted, and other structural
-method names are rejected before training starts.
 
 ### What `main.py` does
 
-For each run, `main.py`:
+For each run:
 
 - Loads a YAML config
 - Injects fixed benchmark defaults for fair comparison
@@ -178,7 +171,7 @@ src/
     models/          # BGM-IV model implementations
     utils/           # data I/O helpers
     tests/           # focused BGM-IV tests
-  configs/           # YAML configs for the three paper experiments
+  configs/           # YAML configs for experiments
   main.py            # experiment entrypoint
   setup.py           # editable source install
 ```
@@ -193,7 +186,33 @@ Runtime files are intentionally ignored by Git:
 - `src/data/`
 - checkpoints and result folders
 
-The active markdown logs are recreated automatically at runtime.
+Running `main.py` creates `src/logs/` and `src/dumps/` automatically. Each run
+gets a dump root named with the benchmark slug and run start time:
+
+```text
+src/dumps/<dataset_slug>_<YYYY-MM-DD_HH-MM-SS-microseconds>/
+```
+
+For the provided configs, `<dataset_slug>` is one of
+`sim_demand_design_iv`, `sim_demand_design_mnist_iv`, or
+`sim_demand_design_vector_iv`. The dump root stores a config snapshot and
+per-setting training summaries, with subfolders such as:
+
+```text
+src/dumps/sim_demand_design_iv_2026-05-06_14-30-10-123456/
+  Sim_Demand_Design_IV.yaml
+  n_samples:<n>-rho:<rho>-v_dim:<v_dim>/
+    training_metric_history_*.csv
+    training_metric_history_*.md
+    best_structural_checkpoints.csv
+    last_structural_checkpoints.csv
+```
+
+The active markdown log is also recreated automatically:
+
+```text
+src/logs/outputs_dev_<dataset_slug>_active.md
+```
 
 ## Citation
 
