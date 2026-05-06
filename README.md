@@ -1,6 +1,6 @@
 # BGM-IV
 
-Bayesian generative modeling for nonlinear instrumental-variable regression.
+Bayesian generative modeling for nonlinear instrumental-variable analysis.
 
 BGM-IV is a Bayesian generative modeling package for nonlinear
 instrumental-variable regression with high-dimensional covariates. It jointly
