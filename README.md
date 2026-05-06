@@ -199,17 +199,14 @@ src/dumps/<dataset_slug>_<YYYY-MM-DD_HH-MM-SS-microseconds>/
 
 For the provided configs, `<dataset_slug>` is one of
 `sim_demand_design_iv`, `sim_demand_design_mnist_iv`, or
-`sim_demand_design_vector_iv`. The dump root stores a config snapshot and
-per-setting training summaries, with subfolders such as:
+`sim_demand_design_vector_iv`. The dump root stores a config snapshot and one
+clean result file per benchmark setting:
 
 ```text
 src/dumps/sim_demand_design_iv_2026-05-06_14-30-10-123456/
   Sim_Demand_Design_IV.yaml
   n_samples:<n>-rho:<rho>-v_dim:<v_dim>/
-    training_metric_history_*.csv
-    training_metric_history_*.md
-    best_structural_checkpoints.csv
-    last_structural_checkpoints.csv
+    results.csv
 ```
 
 The active markdown log is also recreated automatically:
