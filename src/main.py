@@ -494,7 +494,12 @@ def _build_training_history_combo_md_name(params):
 
 def _build_demand_design_run_timestamp(now=None):
     now = datetime.now() if now is None else now
-    return now.strftime("%m-%d-%H-%M-%S")
+    return now.strftime("%Y-%m-%d_%H-%M-%S-%f")
+
+
+def _build_demand_design_run_id(params, now=None):
+    dataset_meta = _get_demand_design_dataset_meta(params)
+    return f"{dataset_meta['slug']}_{_build_demand_design_run_timestamp(now)}"
 
 
 def _demand_design_src_root():
@@ -1527,8 +1532,8 @@ def _run_demand_design_family_parallel(
 
 def _run_demand_design_family(params, single_run_fn):
     """Run demand-design IV experiments aligned with the DFIV benchmark."""
-    run_timestamp = _build_demand_design_run_timestamp()
-    run_root = _demand_design_dumps_dir() / run_timestamp
+    run_id = _build_demand_design_run_id(params)
+    run_root = _demand_design_dumps_dir() / run_id
     run_root.mkdir(parents=True, exist_ok=True)
     _copy_demand_design_config_snapshot(params, run_root)
 

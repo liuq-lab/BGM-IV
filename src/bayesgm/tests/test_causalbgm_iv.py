@@ -1,6 +1,7 @@
 import pytest
 import numpy as np
 import tensorflow as tf
+from datetime import datetime
 from pathlib import Path
 import main as main_module
 
@@ -822,11 +823,37 @@ def test_training_structural_monitor_method_must_be_in_training_structural_metho
 
 
 def test_build_demand_design_run_timestamp_format():
-    stamp = main_module._build_demand_design_run_timestamp()
-    parts = stamp.split("-")
-    assert len(parts) == 5
-    assert all(part.isdigit() for part in parts)
-    assert all(len(part) == 2 for part in parts)
+    stamp = main_module._build_demand_design_run_timestamp(
+        datetime(2026, 5, 5, 14, 47, 28, 123456)
+    )
+
+    assert stamp == "2026-05-05_14-47-28-123456"
+
+
+@pytest.mark.parametrize(
+    ("dataset", "expected"),
+    [
+        (
+            "Sim_Demand_Design_IV",
+            "sim_demand_design_iv_2026-05-05_14-47-28-123456",
+        ),
+        (
+            "Sim_Demand_Design_Mnist_IV",
+            "sim_demand_design_mnist_iv_2026-05-05_14-47-28-123456",
+        ),
+        (
+            "Sim_Demand_Design_Vector_IV",
+            "sim_demand_design_vector_iv_2026-05-05_14-47-28-123456",
+        ),
+    ],
+)
+def test_build_demand_design_run_id_prefixes_dataset_slug(dataset, expected):
+    run_id = main_module._build_demand_design_run_id(
+        {"dataset": dataset},
+        datetime(2026, 5, 5, 14, 47, 28, 123456),
+    )
+
+    assert run_id == expected
 
 
 def test_build_demand_design_combo_dir_name_uses_requested_format():
@@ -875,7 +902,7 @@ def test_rectangularize_training_history_expands_sorted_structural_columns():
 
 
 def test_persist_demand_design_repeat_outputs_writes_expected_files(tmp_path):
-    run_root = tmp_path / "04-06-10-40-58"
+    run_root = tmp_path / "sim_demand_design_iv_2026-05-05_14-47-28-123456"
     run_root.mkdir()
     params = {
         "n_samples": 1000,
@@ -945,7 +972,7 @@ def test_render_demand_design_active_window_omits_updated_at_and_run_id(tmp_path
     source_config = tmp_path / "configs" / "Sim_Demand_Design_IV.yaml"
     source_config.parent.mkdir(parents=True)
     source_config.write_text("dataset: Sim_Demand_Design_IV\n", encoding="utf-8")
-    run_root = tmp_path / "dumps" / "04-06-10-40-58"
+    run_root = tmp_path / "dumps" / "sim_demand_design_iv_2026-05-05_14-47-28-123456"
     run_root.mkdir(parents=True)
     params = {"_config_source_path": str(source_config)}
 
