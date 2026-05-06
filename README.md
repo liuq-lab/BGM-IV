@@ -1,19 +1,24 @@
 # BGM-IV
 
-Bayesian generative modeling for nonlinear instrumental-variable analysis.
+Latent Bayesian generative modeling for nonlinear instrumental-variable analysis
+with high-dimensional covariates.
 
-BGM-IV is a Bayesian generative modeling package for nonlinear
-instrumental-variable regression with high-dimensional covariates. It jointly
-models covariates, treatment, outcome, and instrument-induced treatment
-variation through a structured latent generative model, enabling structural
-prediction under endogenous treatment assignment.
+BGM-IV estimates structural treatment-response functions from observational data
+when treatment assignment is endogenous and valid instruments are available. It
+learns a causally structured latent representation of covariates and replaces
+the confounded outcome likelihood with an IV-integrated pseudo-likelihood
+so that outcome learning is driven by instrument-induced treatment variation.
+
+This design is intended for nonlinear IV settings where useful causal
+information may be embedded in high-dimensional or noisy covariates, while
+remaining applicable to low-dimensional covariates.
 
 ## Highlights
 
 - Nonlinear instrumental-variable regression under endogeneity
 - Latent Bayesian generative modeling for structured covariate representations
 - IV-integrated pseudo-likelihood for endogeneity correction
-- MAP structural prediction for fast point estimates
+- MAP structural prediction for point estimates
 
 ## Installation
 
@@ -146,7 +151,6 @@ appends 215 iid Gaussian nuisance covariates after `[time, image_784]`.
 For each run:
 
 - Loads a YAML config
-- Injects fixed benchmark defaults for fair comparison
 - Simulates the requested demand-design benchmark and structural evaluation grid
 - Trains the appropriate BGM-IV model
 - Computes MAP structural predictions on the original outcome scale
