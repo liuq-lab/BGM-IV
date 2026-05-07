@@ -928,7 +928,7 @@ def _run_single_demand_design_iv(params):
     print(ranges_text)
 
     methods = _resolve_structural_methods(params)
-    normalize_before_training = bool(params.get("normalize_before_training", False))
+    normalize_before_training = bool(params.get("normalize_before_training", True))
 
     if normalize_before_training:
         print("\nNormalized-space experiment")
