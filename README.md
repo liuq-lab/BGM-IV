@@ -33,7 +33,7 @@ conda activate bgmiv_env
 
 ```bash
 git clone https://github.com/liuq-lab/BGM-IV.git
-cd BGM-IV/src
+cd BGM-IV
 pip install -e .
 ```
 
@@ -56,7 +56,7 @@ expected compatible runtime libraries.
 
 Below is a minimal example that mirrors the main workflow: load a configuration,
 simulate demand-design IV data, train BGM-IV, and evaluate MAP structural
-predictions. Run it from `src/`. The example uses the real
+predictions. Run it from the repository root. The example uses the real
 `Sim_Demand_Design_IV` configuration and only overrides runtime settings so the
 demo finishes quickly.
 
@@ -123,7 +123,7 @@ print(f"Structural MSE: {mse:.4f}")
 `main.py` is the primary experiment entrypoint. It reads a YAML configuration
 with `-c` and runs the requested demand-design IV benchmark.
 
-Run all commands from `src/`:
+Run all commands from the repository root:
 
 ```bash
 python main.py -c configs/Sim_Demand_Design_IV.yaml -t 1
@@ -161,40 +161,39 @@ scale using the same evaluation grid across methods.
 
 ## MNIST Cache
 
-The repository does not include `src/data/mnist.npz`. The MNIST-IV simulator
+The repository does not include `data/mnist.npz`. The MNIST-IV simulator
 uses `tf.keras.datasets.mnist.load_data(...)`, so the first MNIST-IV run will
-download the dataset into `src/data/` if it is missing. If the runner has no
+download the dataset into `data/` if it is missing. If the runner has no
 internet access, provide the cache file before running the MNIST config.
 
 ## Project Structure
 
 ```text
-src/
-  bayesgm/
-    datasets/        # demand, MNIST, and vector-proxy simulators
-    models/          # BGM-IV model implementations
-    utils/           # data I/O helpers
-    tests/           # focused BGM-IV tests
-  configs/           # YAML configs for experiments
-  main.py            # experiment entrypoint
-  setup.py           # editable source install
+bayesgm/
+  datasets/        # demand, MNIST, and vector-proxy simulators
+  models/          # BGM-IV model implementations
+  utils/           # data I/O helpers
+  tests/           # focused BGM-IV tests
+configs/           # YAML configs for experiments
+main.py            # experiment entrypoint
+setup.py           # editable source install
 ```
 
 ## Outputs
 
 Runtime files are intentionally ignored by Git:
 
-- `src/logs/`
-- `src/dumps/`
-- `src/sweeps/`
-- `src/data/`
+- `logs/`
+- `dumps/`
+- `sweeps/`
+- `data/`
 - checkpoints and result folders
 
-Running `main.py` creates `src/logs/` and `src/dumps/` automatically. Each run
+Running `main.py` creates `logs/` and `dumps/` automatically. Each run
 gets a dump root named with the benchmark slug and run start time:
 
 ```text
-src/dumps/<dataset_slug>_<YYYY-MM-DD_HH-MM-SS-microseconds>/
+dumps/<dataset_slug>_<YYYY-MM-DD_HH-MM-SS-microseconds>/
 ```
 
 For the provided configs, `<dataset_slug>` is one of
@@ -203,7 +202,7 @@ For the provided configs, `<dataset_slug>` is one of
 clean result file per benchmark setting:
 
 ```text
-src/dumps/sim_demand_design_iv_2026-05-06_14-30-10-123456/
+dumps/sim_demand_design_iv_2026-05-06_14-30-10-123456/
   Sim_Demand_Design_IV.yaml
   n_samples:<n>-rho:<rho>-v_dim:<v_dim>/
     results.csv
@@ -212,7 +211,7 @@ src/dumps/sim_demand_design_iv_2026-05-06_14-30-10-123456/
 The active markdown log is also recreated automatically:
 
 ```text
-src/logs/outputs_dev_<dataset_slug>_active.md
+logs/outputs_dev_<dataset_slug>_active.md
 ```
 
 ## Citation

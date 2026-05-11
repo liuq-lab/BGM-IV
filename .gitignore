@@ -8,12 +8,9 @@ __pycache__/
 *.egg-info/
 
 # Runtime outputs
-src/logs/
-src/dumps/
-src/sweeps/
-src/data/
-src/checkpoints/
-src/results/
+logs/
+dumps/
+data/
 sweeps/
 checkpoints/
 results/
