@@ -219,9 +219,13 @@ logs/outputs_dev_<dataset_slug>_active.md
 If you use BGM-IV in your research, please cite the paper:
 
 ```bibtex
-@misc{luo2026bgmiv,
-  title  = {BGM-IV: an AI-powered Bayesian generative modeling approach for instrumental variable analysis},
-  author = {Luo, Guyue and Liu, Qiao},
-  year   = {2026},
+@misc{luo2026bgmivaipoweredbayesiangenerative,
+      title={BGM-IV: an AI-powered Bayesian generative modeling approach for instrumental variable analysis}, 
+      author={Guyue Luo and Qiao Liu},
+      year={2026},
+      eprint={2605.07029},
+      archivePrefix={arXiv},
+      primaryClass={stat.ML},
+      url={https://arxiv.org/abs/2605.07029}, 
 }
 ```
