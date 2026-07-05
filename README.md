@@ -29,6 +29,18 @@ conda create -n bgmiv_env python=3.9 -y
 conda activate bgmiv_env
 ```
 
+### Install from PyPI
+
+```bash
+pip install bgm-iv
+```
+
+This installs the importable Python package:
+
+```python
+from bgm_iv.models import BGM_IV
+```
+
 ### Install from source
 
 ```bash
@@ -36,6 +48,9 @@ git clone https://github.com/liuq-lab/BGM-IV.git
 cd BGM-IV
 pip install -e .
 ```
+
+Use the source install when you want to run the provided benchmark
+configurations with `main.py`.
 
 ### Dependencies
 
@@ -54,43 +69,48 @@ expected compatible runtime libraries.
 
 ## Quickstart (Python API)
 
-Below is a minimal example that mirrors the main workflow: load a configuration,
-simulate demand-design IV data, train BGM-IV, and evaluate MAP structural
-predictions. Run it from the repository root. The example uses the real
-`Sim_Demand_Design_IV` configuration and only overrides runtime settings so the
-demo finishes quickly.
+Below is a minimal API example that simulates demand-design IV data, trains
+BGM-IV, and evaluates MAP structural predictions. It does not require the
+source-repo `configs/` directory.
 
 ```python
 import numpy as np
-import yaml
+from bgm_iv.datasets import make_demand_design_grid, simulate_demand_design_iv
+from bgm_iv.models import BGM_IV
 
-from bayesgm.datasets import make_demand_design_grid, simulate_demand_design_iv
-from bayesgm.models import BGM_IV
-
-# Load the low-dimensional demand-design configuration
-params = yaml.safe_load(open("configs/Sim_Demand_Design_IV.yaml", "r"))
-
-# Small demo overrides so the example runs quickly
-params.update(
-    {
-        "output_dir": ".",
-        "save_res": False,
-        "save_model": False,
-        "use_bnn": False,
-        "n_samples": 128,
-        "rho": 0.5,
-        "n_repeat": 1,
-        "fit_epochs": 1,
-        "fit_egm_n_iter": 0,
-        "fit_batch_size": 32,
-        "iv_mc_samples": 4,
-        "eval_mc_samples": 4,
-        "structural_map_steps": 5,
-        "v_dim": 2,
-        "w_dim": 1,
-        "seed": 0,
-    }
-)
+params = {
+    "dataset": "Sim_Demand_Design_IV",
+    "output_dir": ".",
+    "save_res": False,
+    "save_model": False,
+    "use_bnn": False,
+    "binary_treatment": False,
+    "n_samples": 128,
+    "rho": 0.5,
+    "fit_epochs": 1,
+    "fit_batch_size": 32,
+    "fit_egm_n_iter": 0,
+    "z_dims": [2, 2, 1, 2],
+    "v_dim": 2,
+    "w_dim": 1,
+    "g_units": [64, 64],
+    "f_units": [64, 32],
+    "h_units": [64, 32],
+    "e_units": [64, 64],
+    "dz_units": [64, 32],
+    "lr_theta": 1e-4,
+    "lr_z": 1e-4,
+    "lr": 2e-4,
+    "g_d_freq": 5,
+    "kl_weight": 1e-4,
+    "latent_pzv_weight": 0.5,
+    "use_z_rec": True,
+    "iv_mc_samples": 4,
+    "eval_mc_samples": 4,
+    "structural_map_steps": 5,
+    "structural_map_lr": 1e-4,
+    "seed": 0,
+}
 
 train = simulate_demand_design_iv(
     n_samples=params["n_samples"],
@@ -120,8 +140,10 @@ print(f"Structural MSE: {mse:.4f}")
 
 ## Reproducing Experiments With `main.py`
 
-`main.py` is the primary experiment entrypoint. It reads a YAML configuration
-with `-c` and runs the requested demand-design IV benchmark.
+`main.py` is the primary source-repo experiment entrypoint. It reads a YAML
+configuration with `-c` and runs the requested demand-design IV benchmark.
+These benchmark configs are provided in the GitHub repository, not as the
+primary PyPI interface.
 
 Run all commands from the repository root:
 
@@ -169,7 +191,7 @@ internet access, provide the cache file before running the MNIST config.
 ## Project Structure
 
 ```text
-bayesgm/
+bgm_iv/
   datasets/        # demand, MNIST, and vector-proxy simulators
   models/          # BGM-IV model implementations
   utils/           # data I/O helpers

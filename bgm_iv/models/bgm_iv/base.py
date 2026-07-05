@@ -2,8 +2,8 @@ import tensorflow as tf
 import tensorflow_probability as tfp
 from ..networks import BaseFullyConnectedNet, Discriminator, BayesianFullyConnectedNet
 import numpy as np
-from bayesgm.datasets import Gaussian_sampler
-from bayesgm.utils.data_io import save_data
+from bgm_iv.datasets import Gaussian_sampler
+from bgm_iv.utils.data_io import save_data
 import dateutil.tz
 import datetime
 import os

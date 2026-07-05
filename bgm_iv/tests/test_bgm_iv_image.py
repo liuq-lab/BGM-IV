@@ -5,14 +5,14 @@ import pytest
 import tensorflow as tf
 import main as main_module
 
-from bayesgm.datasets import make_demand_design_grid, simulate_demand_design_iv
-from bayesgm.datasets.simulator_image import (
+from bgm_iv.datasets import make_demand_design_grid, simulate_demand_design_iv
+from bgm_iv.datasets.simulator_image import (
     make_demand_design_mnist_grid,
     simulate_demand_design_mnist_iv,
 )
-from bayesgm.models.bgm_iv import BGM_IV_Image
-from bayesgm.models.networks import DemandImageFeatureExtractor
-import bayesgm.datasets.simulator_image as simulator_image_module
+from bgm_iv.models.bgm_iv import BGM_IV_Image
+from bgm_iv.models.networks import DemandImageFeatureExtractor
+import bgm_iv.datasets.simulator_image as simulator_image_module
 
 tf.config.threading.set_intra_op_parallelism_threads(1)
 tf.config.threading.set_inter_op_parallelism_threads(1)

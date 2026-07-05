@@ -2,14 +2,14 @@ import numpy as np
 import pytest
 import tensorflow as tf
 
-from bayesgm.datasets import (
+from bgm_iv.datasets import (
     make_demand_design_grid,
     make_demand_design_vector_grid,
     simulate_demand_design_iv,
     simulate_demand_design_vector_iv,
 )
-from bayesgm.models.bgm_iv import BGM_IV_Vector
-from bayesgm.models.networks import DemandVectorFeatureExtractor
+from bgm_iv.models.bgm_iv import BGM_IV_Vector
+from bgm_iv.models.networks import DemandVectorFeatureExtractor
 
 
 def _make_vector_params(output_dir):

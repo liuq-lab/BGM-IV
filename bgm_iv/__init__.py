@@ -1,7 +1,7 @@
 from importlib import import_module
 from typing import TYPE_CHECKING
 
-__version__ = "1.0.2"
+__version__ = "0.1.0"
 
 if TYPE_CHECKING:
     from . import datasets, models, utils
@@ -12,15 +12,15 @@ if TYPE_CHECKING:
     )
 
 _SYMBOL_TO_MODULE = {
-    "BGM_IV": "bayesgm.models.bgm_iv",
-    "BGM_IV_Image": "bayesgm.models.bgm_iv",
-    "BGM_IV_Vector": "bayesgm.models.bgm_iv",
+    "BGM_IV": "bgm_iv.models.bgm_iv",
+    "BGM_IV_Image": "bgm_iv.models.bgm_iv",
+    "BGM_IV_Vector": "bgm_iv.models.bgm_iv",
 }
 
 _MODULE_ATTRIBUTES = {
-    "models": "bayesgm.models",
-    "datasets": "bayesgm.datasets",
-    "utils": "bayesgm.utils",
+    "models": "bgm_iv.models",
+    "datasets": "bgm_iv.datasets",
+    "utils": "bgm_iv.utils",
 }
 
 __all__ = [

@@ -16,12 +16,12 @@ import time
 import traceback
 from itertools import product
 import yaml
-from bayesgm.models import (
+from bgm_iv.models import (
     BGM_IV,
     BGM_IV_Image,
     BGM_IV_Vector,
 )
-from bayesgm.datasets import (
+from bgm_iv.datasets import (
     simulate_demand_design_iv,
     make_demand_design_grid,
     simulate_demand_design_mnist_iv,

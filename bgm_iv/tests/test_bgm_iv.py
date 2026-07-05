@@ -5,13 +5,13 @@ from datetime import datetime
 from pathlib import Path
 import main as main_module
 
-from bayesgm.datasets import (
+from bgm_iv.datasets import (
     demand_design_h,
     demand_design_structural_function,
     make_demand_design_grid,
     simulate_demand_design_iv,
 )
-from bayesgm.models.bgm_iv import BGM_IV
+from bgm_iv.models.bgm_iv import BGM_IV
 
 tf.config.threading.set_intra_op_parallelism_threads(1)
 tf.config.threading.set_inter_op_parallelism_threads(1)
