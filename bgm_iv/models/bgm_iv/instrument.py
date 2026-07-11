@@ -439,7 +439,7 @@ class BGM_IV(CausalBGM):
             method = self.params["structural_latent_method"]
 
         if initial_z is None:
-            initial_z = self.e_net(data_v).numpy()
+            initial_z = self.e_net(data_v, training=False).numpy()
         else:
             initial_z = self._to_2d_float32(initial_z)
 
