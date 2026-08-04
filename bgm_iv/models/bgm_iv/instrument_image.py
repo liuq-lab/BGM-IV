@@ -253,6 +253,96 @@ class BGM_IV_Image(BGM_IV):
         return e_loss_adv, l2_loss_v, l2_loss_z, l2_loss_x, l2_loss_y, g_e_loss
 
     @tf.function
+    def train_gen_step_integral(self, data_z, data_v, data_w, data_x, data_y):
+        """Integral-EGM step for the image-covariate variant: this class's
+        v-side machinery + the base class's integrated outcome block."""
+        with tf.GradientTape(persistent=True) as gen_tape:
+            decoded = self._decode_covariates(data_z, training=True)
+            data_v_ = decoded["public_v"]
+
+            data_z_ = self.e_net(data_v, training=True)
+            data_z0, data_z1, data_z2 = self._split_z(data_z_)
+            data_z__ = self.e_net(data_v_, training=True)
+            data_v__ = self._decode_covariates(data_z_, training=True)["public_v"]
+            data_dz_ = self.dz_net(data_z_)
+
+            l2_loss_v = self._covariate_cycle_mse(data_v, data_v__)
+            l2_loss_z = tf.reduce_mean((data_z - data_z__) ** 2)
+            e_loss_adv = -tf.reduce_mean(data_dz_)
+            sigma_square_loss = tf.reduce_mean(tf.square(decoded["time_var"]))
+            if self.extra_noise_dim > 0:
+                sigma_square_loss += tf.reduce_mean(tf.square(decoded["noise_var"]))
+
+            h_output = self.h_net(tf.concat([data_z0, data_z2, data_w], axis=-1))
+            data_x_ = h_output[:, :1]
+            if self.params["binary_treatment"]:
+                l2_loss_x = tf.reduce_mean(
+                    tf.nn.sigmoid_cross_entropy_with_logits(
+                        labels=data_x, logits=data_x_
+                    )
+                )
+                prob_x = tf.sigmoid(data_x_)
+                f_out_one = self.f_net(
+                    tf.concat([data_z0, data_z1, tf.ones_like(data_x_)], axis=-1)
+                )
+                f_out_zero = self.f_net(
+                    tf.concat([data_z0, data_z1, tf.zeros_like(data_x_)], axis=-1)
+                )
+                data_y_ = prob_x * f_out_one[:, :1] + (1.0 - prob_x) * f_out_zero[:, :1]
+                sigma_square_loss += tf.reduce_mean(tf.square(f_out_one[:, -1]))
+                sigma_square_loss += tf.reduce_mean(tf.square(f_out_zero[:, -1]))
+            else:
+                sigma_square_loss += tf.reduce_mean(tf.square(h_output[:, -1]))
+                l2_loss_x = tf.reduce_mean((data_x_ - data_x) ** 2)
+
+                sigma_mode = self.params["egm_outcome_sigma"]
+                if sigma_mode == "head":
+                    sigma_square_x = self._continuous_sigma(
+                        h_output, sigma_key="sigma_x"
+                    )
+                elif sigma_mode == "residual_ema":
+                    batch_resid = tf.stop_gradient(
+                        tf.reduce_mean(tf.square(data_x - data_x_))
+                    )
+                    self.egm_sigma2_x_ema.assign(
+                        0.99 * self.egm_sigma2_x_ema + 0.01 * batch_resid
+                    )
+                    sigma_square_x = self.egm_sigma2_x_ema * tf.ones_like(data_x_)
+                else:
+                    sigma_square_x = float(sigma_mode) ** 2 * tf.ones_like(data_x_)
+                cap = float(self.params["egm_outcome_sigma_cap"])
+                sigma_square_x = tf.minimum(sigma_square_x, cap ** 2)
+
+                sigma_x = tf.stop_gradient(tf.sqrt(sigma_square_x))
+                x_nodes = (
+                    data_x_[None, :, :]
+                    + 1.4142135623730951 * sigma_x[None, :, :] * self._egm_gh_t
+                )
+                f_outputs = self._outcome_outputs_for_samples(data_z_, x_nodes)
+                data_y_ = tf.reduce_sum(self._egm_gh_w * f_outputs[:, :, :1], axis=0)
+                sigma_square_loss += tf.reduce_mean(tf.square(f_outputs[:, :, -1]))
+
+            l2_loss_y = tf.reduce_mean((data_y_ - data_y) ** 2)
+
+            g_e_loss = (
+                e_loss_adv
+                + (l2_loss_v + self.params["use_z_rec"] * l2_loss_z)
+                + l2_loss_x
+                + l2_loss_y
+                + 0.001 * sigma_square_loss
+            )
+
+        trainable_variables = (
+            self.g_net.trainable_variables
+            + self.e_net.trainable_variables
+            + self.f_net.trainable_variables
+            + self.h_net.trainable_variables
+        )
+        g_e_gradients = gen_tape.gradient(g_e_loss, trainable_variables)
+        self.g_pre_optimizer.apply_gradients(zip(g_e_gradients, trainable_variables))
+        return e_loss_adv, l2_loss_v, l2_loss_z, l2_loss_x, l2_loss_y, g_e_loss
+
+    @tf.function
     def evaluate(self, data, data_z=None, nb_intervals=200):
         data_x, data_y, data_v, data_w = data
         if data_z is None:

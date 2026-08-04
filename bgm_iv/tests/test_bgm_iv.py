@@ -1043,3 +1043,60 @@ def test_use_gpu_config_defaults_to_false_when_omitted(monkeypatch, capsys):
 
     assert dummy_config.visible_device_calls == [([], "GPU")]
     assert "TensorFlow GPU disabled. Using CPU only." in capsys.readouterr().out
+
+def _egm_params(tmp_path, **overrides):
+    params = {
+        "dataset": "unit", "output_dir": str(tmp_path), "save_res": False,
+        "save_model": False, "binary_treatment": False, "use_bnn": False,
+        "z_dims": [2, 2, 1, 2], "v_dim": 2, "w_dim": 1,
+        "lr": 2e-4, "lr_theta": 1e-4, "lr_z": 1e-4,
+        "g_units": [16, 16], "e_units": [16, 16], "f_units": [16, 8],
+        "h_units": [16, 8], "dz_units": [16, 8],
+        "kl_weight": 1e-4, "g_d_freq": 1, "use_z_rec": True,
+        "iv_mc_samples": 8, "eval_mc_samples": 8,
+    }
+    params.update(overrides)
+    return params
+
+
+def test_egm_integral_gh1_equals_plugin(tmp_path):
+    train = simulate_demand_design_iv(n_samples=64, rho=0.5, seed=7)
+    batches = (train["x"][:32], train["y"][:32], train["v"][:32], train["w"][:32])
+    z = np.random.default_rng(0).normal(size=(32, 7)).astype(np.float32)
+
+    m_plug = BGM_IV(_egm_params(tmp_path), random_seed=42)
+    m_int = BGM_IV(
+        _egm_params(tmp_path, egm_outcome_loss="integral", egm_outcome_gh_nodes=1),
+        random_seed=42,
+    )
+    for _ in range(10):
+        out_p = m_plug.train_gen_step(z, batches[2], batches[3], batches[0], batches[1])
+        out_i = m_int.train_gen_step_integral(
+            z, batches[2], batches[3], batches[0], batches[1]
+        )
+        for a, b in zip(out_p, out_i):
+            np.testing.assert_allclose(a.numpy(), b.numpy(), rtol=1e-5, atol=1e-6)
+
+
+def _standardize(arr):
+    arr = np.asarray(arr, dtype=np.float32)
+    std = arr.std(axis=0, keepdims=True)
+    std = np.where(std < 1e-6, 1.0, std)
+    return (arr - arr.mean(axis=0, keepdims=True)) / std
+
+
+def test_egm_integral_gh8_finite_and_ema_calibrates(tmp_path):
+    train = simulate_demand_design_iv(n_samples=96, rho=0.5, seed=11)
+    data = tuple(_standardize(train[key]) for key in ("x", "y", "v", "w"))
+    m = BGM_IV(
+        _egm_params(tmp_path, egm_outcome_loss="integral", egm_outcome_gh_nodes=8),
+        random_seed=1,
+    )
+    m.training_history = []
+    m.egm_init(
+        data,
+        egm_n_iter=60, batch_size=32, egm_batches_per_eval=1000, verbose=0,
+    )
+    ema = float(m.egm_sigma2_x_ema.numpy())
+    assert np.isfinite(ema)
+    assert 0.0 < ema < 4.0

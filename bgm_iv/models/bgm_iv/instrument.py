@@ -49,6 +49,10 @@ class BGM_IV(CausalBGM):
         self.params.setdefault("structural_map_steps", 100)
         self.params.setdefault("structural_map_lr", self.params["lr_z"])
         self.params.setdefault("latent_pzv_weight", 1.0)
+        self.params.setdefault("egm_outcome_loss", "integral")
+        self.params.setdefault("egm_outcome_gh_nodes", 8)
+        self.params.setdefault("egm_outcome_sigma", "residual_ema") 
+        self.params.setdefault("egm_outcome_sigma_cap", 1.0)
         self.timestamp = timestamp
 
         if random_seed is not None:
@@ -102,6 +106,15 @@ class BGM_IV(CausalBGM):
             self.params["lr"], beta_1=0.9, beta_2=0.99
         )
         self.z_sampler = Gaussian_sampler(mean=np.zeros(z_dim), sd=1.0)
+        gh_nodes = int(self.params["egm_outcome_gh_nodes"])
+        gh_t, gh_w = np.polynomial.hermite.hermgauss(gh_nodes)
+        self._egm_gh_t = tf.constant(gh_t.reshape(gh_nodes, 1, 1), dtype=tf.float32)
+        self._egm_gh_w = tf.constant(
+            (gh_w / np.sqrt(np.pi)).reshape(gh_nodes, 1, 1), dtype=tf.float32
+        )
+        self.egm_sigma2_x_ema = tf.Variable(
+            1.0, trainable=False, dtype=tf.float32, name="egm_sigma2_x_ema"
+        )
 
         self.g_optimizer = tf.keras.optimizers.Adam(
             self.params["lr_theta"], beta_1=0.9, beta_2=0.99
@@ -907,6 +920,106 @@ class BGM_IV(CausalBGM):
         self.g_pre_optimizer.apply_gradients(zip(g_e_gradients, trainable_variables))
         return e_loss_adv, l2_loss_v, l2_loss_z, l2_loss_x, l2_loss_y, g_e_loss
 
+    @tf.function
+    def train_gen_step_integral(self, data_z, data_v, data_w, data_x, data_y):
+        """EGM warm-start step with the integrated outcome moment condition.
+
+        Replaces the naive plug-in ``f(z, mu_x)`` by the first-moment
+        condition ``(y - E[f(z, x) | w, e(v)])**2`` of the IV
+        pseudo-likelihood. The 1-D Gaussian integral is evaluated with
+        Gauss-Hermite quadrature (deterministic; exact for polynomials of
+        degree <= 2*nodes - 1). Binary treatment uses the exact two-point
+        integral instead of inserting a fractional probability into f.
+        """
+        with tf.GradientTape(persistent=True) as gen_tape:
+            sigma_square_loss = 0.0
+            g_output = self.g_net(data_z)
+            data_v_ = g_output[:, : self.params["v_dim"]]
+            sigma_square_loss += tf.reduce_mean(tf.square(g_output[:, -1]))
+
+            data_z_ = self.e_net(data_v)
+            data_z0, data_z1, data_z2 = self._split_z(data_z_)
+
+            data_z__ = self.e_net(data_v_)
+            data_v__ = self.g_net(data_z_)[:, : self.params["v_dim"]]
+            data_dz_ = self.dz_net(data_z_)
+
+            l2_loss_v = tf.reduce_mean((data_v - data_v__) ** 2)
+            l2_loss_z = tf.reduce_mean((data_z - data_z__) ** 2)
+            e_loss_adv = -tf.reduce_mean(data_dz_)
+
+            h_output = self.h_net(tf.concat([data_z0, data_z2, data_w], axis=-1))
+            data_x_ = h_output[:, :1]
+            if self.params["binary_treatment"]:
+                l2_loss_x = tf.reduce_mean(
+                    tf.nn.sigmoid_cross_entropy_with_logits(
+                        labels=data_x, logits=data_x_
+                    )
+                )
+                prob_x = tf.sigmoid(data_x_)
+                f_out_one = self.f_net(
+                    tf.concat([data_z0, data_z1, tf.ones_like(data_x_)], axis=-1)
+                )
+                f_out_zero = self.f_net(
+                    tf.concat([data_z0, data_z1, tf.zeros_like(data_x_)], axis=-1)
+                )
+                data_y_ = prob_x * f_out_one[:, :1] + (1.0 - prob_x) * f_out_zero[:, :1]
+                sigma_square_loss += tf.reduce_mean(tf.square(f_out_one[:, -1]))
+                sigma_square_loss += tf.reduce_mean(tf.square(f_out_zero[:, -1]))
+            else:
+                sigma_square_loss += tf.reduce_mean(tf.square(h_output[:, -1]))
+                l2_loss_x = tf.reduce_mean((data_x_ - data_x) ** 2)
+
+                sigma_mode = self.params["egm_outcome_sigma"]
+                if sigma_mode == "head":
+                    sigma_square_x = self._continuous_sigma(
+                        h_output, sigma_key="sigma_x"
+                    )
+                elif sigma_mode == "residual_ema":
+                    batch_resid = tf.stop_gradient(
+                        tf.reduce_mean(tf.square(data_x - data_x_))
+                    )
+                    self.egm_sigma2_x_ema.assign(
+                        0.99 * self.egm_sigma2_x_ema + 0.01 * batch_resid
+                    )
+                    sigma_square_x = self.egm_sigma2_x_ema * tf.ones_like(data_x_)
+                else:
+                    sigma_square_x = float(sigma_mode) ** 2 * tf.ones_like(data_x_)
+                cap = float(self.params["egm_outcome_sigma_cap"])
+                sigma_square_x = tf.minimum(sigma_square_x, cap ** 2)
+
+                # mu keeps its gradient path into h (same as the plug-in);
+                # sigma is stop-gradient so f cannot lower the loss by
+                # inflating the integration width.
+                sigma_x = tf.stop_gradient(tf.sqrt(sigma_square_x))
+                x_nodes = (
+                    data_x_[None, :, :]
+                    + 1.4142135623730951 * sigma_x[None, :, :] * self._egm_gh_t
+                )
+                f_outputs = self._outcome_outputs_for_samples(data_z_, x_nodes)
+                data_y_ = tf.reduce_sum(self._egm_gh_w * f_outputs[:, :, :1], axis=0)
+                sigma_square_loss += tf.reduce_mean(tf.square(f_outputs[:, :, -1]))
+
+            l2_loss_y = tf.reduce_mean((data_y_ - data_y) ** 2)
+
+            g_e_loss = (
+                e_loss_adv
+                + (l2_loss_v + self.params["use_z_rec"] * l2_loss_z)
+                + l2_loss_x
+                + l2_loss_y
+                + 0.001 * sigma_square_loss
+            )
+
+        trainable_variables = (
+            self.g_net.trainable_variables
+            + self.e_net.trainable_variables
+            + self.f_net.trainable_variables
+            + self.h_net.trainable_variables
+        )
+        g_e_gradients = gen_tape.gradient(g_e_loss, trainable_variables)
+        self.g_pre_optimizer.apply_gradients(zip(g_e_gradients, trainable_variables))
+        return e_loss_adv, l2_loss_v, l2_loss_z, l2_loss_x, l2_loss_y, g_e_loss
+
     def egm_init(
         self,
         data,
@@ -920,6 +1033,18 @@ class BGM_IV(CausalBGM):
         data_x, data_y, data_v, data_w = self._parse_train_data(data)
 
         print("EGM Initialization Starts ...")
+        use_integral = str(self.params.get("egm_outcome_loss", "plugin")) == "integral"
+        overrides_plugin = type(self).train_gen_step is not BGM_IV.train_gen_step
+        has_own_integral = (
+            type(self).train_gen_step_integral is not BGM_IV.train_gen_step_integral
+        )
+        if use_integral and overrides_plugin and not has_own_integral:
+            raise NotImplementedError(
+                "egm_outcome_loss='integral' pairs with the base BGM_IV EGM step; "
+                f"{type(self).__name__} overrides train_gen_step and needs its own "
+                "integral variant before this flag can be enabled."
+            )
+        egm_gen_step = self.train_gen_step_integral if use_integral else self.train_gen_step
         for batch_iter in range(egm_n_iter + 1):
             for _ in range(self.params["g_d_freq"]):
                 batch_idx = np.random.choice(len(data_x), batch_size, replace=False)
@@ -934,7 +1059,7 @@ class BGM_IV(CausalBGM):
             batch_v = data_v[batch_idx, :]
             batch_w = data_w[batch_idx, :]
             e_loss_adv, l2_loss_v, l2_loss_z, l2_loss_x, l2_loss_y, g_e_loss = (
-                self.train_gen_step(batch_z, batch_v, batch_w, batch_x, batch_y)
+                egm_gen_step(batch_z, batch_v, batch_w, batch_x, batch_y)
             )
             if batch_iter % egm_batches_per_eval == 0:
                 loss_contents = (
