@@ -1100,3 +1100,28 @@ def test_egm_integral_gh8_finite_and_ema_calibrates(tmp_path):
     ema = float(m.egm_sigma2_x_ema.numpy())
     assert np.isfinite(ema)
     assert 0.0 < ema < 4.0
+
+def test_egm_integral_grad_path_stop_runs_and_diverges(tmp_path):
+    train = simulate_demand_design_iv(n_samples=64, rho=0.5, seed=3)
+    batches = (train["x"][:32], train["y"][:32], train["v"][:32], train["w"][:32])
+    z = np.random.default_rng(1).normal(size=(32, 7)).astype(np.float32)
+
+    m_mean = BGM_IV(_egm_params(tmp_path, egm_outcome_loss="integral"), random_seed=5)
+    m_stop = BGM_IV(
+        _egm_params(tmp_path, egm_outcome_loss="integral", egm_outcome_grad_path="stop"),
+        random_seed=5,
+    )
+    for _ in range(5):
+        outs_mean = m_mean.train_gen_step_integral(
+            z, batches[2], batches[3], batches[0], batches[1]
+        )
+        outs_stop = m_stop.train_gen_step_integral(
+            z, batches[2], batches[3], batches[0], batches[1]
+        )
+    for a, b in zip(outs_mean, outs_stop):
+        assert np.isfinite(float(a.numpy()))
+        assert np.isfinite(float(b.numpy()))
+    assert any(
+        not np.isclose(float(a.numpy()), float(b.numpy()), rtol=1e-6)
+        for a, b in zip(outs_mean, outs_stop)
+    )

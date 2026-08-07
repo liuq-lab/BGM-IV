@@ -53,6 +53,7 @@ class BGM_IV(CausalBGM):
         self.params.setdefault("egm_outcome_gh_nodes", 8)
         self.params.setdefault("egm_outcome_sigma", "residual_ema") 
         self.params.setdefault("egm_outcome_sigma_cap", 1.0)
+        self.params.setdefault("egm_outcome_grad_path", "mean")  # "mean" | "stop"
         self.timestamp = timestamp
 
         if random_seed is not None:
@@ -957,6 +958,8 @@ class BGM_IV(CausalBGM):
                     )
                 )
                 prob_x = tf.sigmoid(data_x_)
+                if str(self.params["egm_outcome_grad_path"]) == "stop":
+                    prob_x = tf.stop_gradient(prob_x)
                 f_out_one = self.f_net(
                     tf.concat([data_z0, data_z1, tf.ones_like(data_x_)], axis=-1)
                 )
@@ -988,12 +991,16 @@ class BGM_IV(CausalBGM):
                 cap = float(self.params["egm_outcome_sigma_cap"])
                 sigma_square_x = tf.minimum(sigma_square_x, cap ** 2)
 
-                # mu keeps its gradient path into h (same as the plug-in);
+                # mu keeps its gradient path into h (same as the plug-in), unless egm_outcome_grad_path='stop'
                 # sigma is stop-gradient so f cannot lower the loss by
                 # inflating the integration width.
                 sigma_x = tf.stop_gradient(tf.sqrt(sigma_square_x))
+                if str(self.params["egm_outcome_grad_path"]) == "stop":
+                    x_center = tf.stop_gradient(data_x_)
+                else:
+                    x_center = data_x_
                 x_nodes = (
-                    data_x_[None, :, :]
+                    x_center[None, :, :]
                     + 1.4142135623730951 * sigma_x[None, :, :] * self._egm_gh_t
                 )
                 f_outputs = self._outcome_outputs_for_samples(data_z_, x_nodes)

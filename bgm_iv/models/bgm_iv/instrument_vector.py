@@ -263,6 +263,8 @@ class BGM_IV_Vector(BGM_IV):
                     )
                 )
                 prob_x = tf.sigmoid(data_x_)
+                if str(self.params["egm_outcome_grad_path"]) == "stop":
+                    prob_x = tf.stop_gradient(prob_x)
                 f_out_one = self.f_net(
                     tf.concat([data_z0, data_z1, tf.ones_like(data_x_)], axis=-1)
                 )
@@ -295,8 +297,12 @@ class BGM_IV_Vector(BGM_IV):
                 sigma_square_x = tf.minimum(sigma_square_x, cap ** 2)
 
                 sigma_x = tf.stop_gradient(tf.sqrt(sigma_square_x))
+                if str(self.params["egm_outcome_grad_path"]) == "stop":
+                    x_center = tf.stop_gradient(data_x_)
+                else:
+                    x_center = data_x_
                 x_nodes = (
-                    data_x_[None, :, :]
+                    x_center[None, :, :]
                     + 1.4142135623730951 * sigma_x[None, :, :] * self._egm_gh_t
                 )
                 f_outputs = self._outcome_outputs_for_samples(data_z_, x_nodes)
