@@ -104,8 +104,30 @@ repository root with one of the YAML configurations under `configs/`:
 python main.py -c configs/Sim_Demand_Design_IV.yaml -t 1
 ```
 
-The YAML files cover the included low-dimensional, vector, and image
-benchmarks and are the authoritative source for experiment-specific settings.
+A configuration may define a Cartesian-product sweep. The vector configuration
+contains 3 sample sizes, 5 values of `rho`, and 20 repeats. Scalar `--set`
+overrides collapse only the named axes; unspecified axes remain active. Using
+`configs/Sim_Demand_Design_Vector_IV.yaml`, the common cases are:
+
+| Additional arguments | Concrete runs |
+| --- | ---: |
+| `-t 1` | 300, sequentially |
+| `--set n_samples=5000 -t 2` | 100; all 5 values of `rho` and 20 repeats, at most 2 concurrently |
+| `--set n_samples=5000 --set rho=0.5 -t 1` | 20 repeats, sequentially |
+| `--set n_samples=5000 --repeat-id 0 -t 1` | 5; repeat 0 at every value of `rho` |
+| `--set n_samples=5000 --set rho=0.5 --repeat-id 0 -t 1` | 1 |
+
+For example, the second case is:
+
+```bash
+python main.py -c configs/Sim_Demand_Design_Vector_IV.yaml \
+  --set n_samples=5000 -t 2
+```
+
+`-t N` changes only the maximum concurrency, not the number of runs. When
+`use_gpu: true`, each worker requires a distinct visible GPU. `--repeat-id`
+accepts one integer in `0, ..., n_repeat - 1`, requires `-t 1`, and applies to
+every sweep-axis combination that remains active.
 
 ## MNIST Cache
 
