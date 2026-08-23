@@ -8,6 +8,8 @@ when treatment assignment is endogenous and valid instruments are available. It
 learns a causally structured latent representation of covariates and replaces
 the confounded outcome likelihood with an IV-integrated pseudo-likelihood
 so that outcome learning is driven by instrument-induced treatment variation.
+It also supports MCMC integration over the latent covariate posterior for
+uncertainty-aware structural prediction.
 
 This design is intended for nonlinear IV settings where useful causal
 information may be embedded in high-dimensional or noisy covariates, while
@@ -19,8 +21,31 @@ remaining applicable to low-dimensional covariates.
 - Latent Bayesian generative modeling for structured covariate representations
 - IV-integrated pseudo-likelihood for endogeneity correction
 - Structural prediction with MAP, encoder, and posterior-integration readouts
+- Uncertainty quantification through multi-chain latent-posterior MCMC
 - Reproducible benchmarks for low-dimensional, high-dimensional, and image
   covariates
+
+## Uncertainty Quantification
+
+In addition to point prediction, BGM-IV can average the structural outcome
+network over draws from the fitted latent posterior,
+
+$$
+\widehat g(x,v)
+=
+\frac{1}{M}\sum_{m=1}^{M}
+\mu_{\widehat\omega}\!\left(x,z_Y^{(m)}\right),
+\qquad
+z^{(m)}\sim p_{\widehat\theta}(z\mid v).
+$$
+
+This propagates latent-state uncertainty into posterior-integrated structural
+estimates and outcome predictive intervals. The MCMC pipeline uses multiple
+overdispersed HMC chains and records convergence, effective-sample-size,
+divergence, and Monte Carlo error diagnostics before reporting a certified
+result. These uncertainty summaries are conditional on the fitted networks;
+they quantify latent and predictive uncertainty rather than a full posterior
+over all network parameters.
 
 ## Installation
 
