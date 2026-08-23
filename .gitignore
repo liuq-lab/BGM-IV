@@ -16,7 +16,3 @@ data/
 sweeps/
 checkpoints/
 results/
-
-# Local smoke-test and monitoring workspaces
-.codex-sandboxes/
-.codex-monitor/

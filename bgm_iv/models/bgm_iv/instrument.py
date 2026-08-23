@@ -48,12 +48,19 @@ class BGM_IV(CausalBGM):
         self.params.setdefault("structural_latent_method", "map")
         self.params.setdefault("structural_map_steps", 100)
         self.params.setdefault("structural_map_lr", self.params["lr_z"])
-        self.params.setdefault("latent_pzv_weight", 1.0)
         self.params.setdefault("egm_outcome_loss", "integral")
         self.params.setdefault("egm_outcome_gh_nodes", 8)
         self.params.setdefault("egm_outcome_sigma", "residual_ema") 
         self.params.setdefault("egm_outcome_sigma_cap", 1.0)
         self.params.setdefault("egm_outcome_grad_path", "mean")  # "mean" | "stop"
+        # `mcmc_seed` seeds every test-time stochastic procedure (certification
+        # seed derivation, diagnostics); structural MCMC runs through
+        # `bgm_iv.mcmc.certify`.
+        self.params.setdefault("mcmc_seed", None)
+        # "sum": high-dimensional covariate blocks enter the objective as
+        # log-likelihood sums, in training and in `get_log_covariate_posterior`
+        # alike.  "mean" down-weights a block by its dimension (per-dim average).
+        self.params.setdefault("covariate_block_scale", "sum")
         self.timestamp = timestamp
 
         if random_seed is not None:
@@ -366,6 +373,17 @@ class BGM_IV(CausalBGM):
         return self.f_net(tf.concat([data_z0, data_z1, data_x], axis=-1))
 
     def _continuous_sigma(self, net_output, sigma_key, eps=1e-6):
+        soft_key = sigma_key + "_softfloor"
+        if soft_key in self.params:
+            # Soft variance floor: sigma = sigma_min + softplus-positive
+            # learned sd (head stays trainable, bounded below by sigma_min).
+            if sigma_key in self.params:
+                raise ValueError(
+                    f"{sigma_key} and {soft_key} are mutually exclusive"
+                )
+            sigma_min = tf.cast(float(self.params[soft_key]), tf.float32)
+            learned_sd = tf.sqrt(tf.nn.softplus(net_output[:, -1:]) + eps)
+            return tf.square(sigma_min + learned_sd)
         if sigma_key in self.params:
             sigma_square = tf.cast(self.params[sigma_key] ** 2, tf.float32)
             sigma_square = tf.ones_like(net_output[:, :1]) * sigma_square
@@ -639,10 +657,12 @@ class BGM_IV(CausalBGM):
         )
         outcome_outputs = self._outcome_outputs_for_samples(data_z, x_samples)
         mu_y = outcome_outputs[:, :, :1]
-        if "sigma_y" in self.params:
-            sigma_square_y = tf.cast(self.params["sigma_y"] ** 2, tf.float32)
-        else:
-            sigma_square_y = tf.nn.softplus(outcome_outputs[:, :, 1:2]) + eps
+        # Same noise model as prediction and calibration (fixed override or
+        # soft-floored head), so training and inference share one sigma_y.
+        sigma_square_y = self._continuous_sigma(
+            tf.reshape(outcome_outputs, (-1, 2)), sigma_key="sigma_y", eps=eps
+        )
+        sigma_square_y = tf.reshape(sigma_square_y, tf.shape(mu_y))
         data_y = tf.expand_dims(data_y, axis=0)
         log_prob_samples = -(
             (data_y - mu_y) ** 2 / (2.0 * sigma_square_y)
@@ -847,13 +867,9 @@ class BGM_IV(CausalBGM):
                 loss_py_z = tf.constant(0.0, dtype=tf.float32)
 
             loss_prior_z = tf.reduce_mean(tf.reduce_sum(data_z ** 2, axis=1) / 2.0)
-            latent_pzv_weight = tf.cast(
-                self.params["latent_pzv_weight"], tf.float32
-            )
             loss_posterior_z = (
-                latent_pzv_weight * (loss_pv_z + loss_prior_z)
-                + loss_px_z
-                + loss_py_z
+                loss_pv_z + loss_prior_z + loss_px_z
+                + self._outcome_to_particles_weight() * loss_py_z
             )
 
         posterior_gradients = tape.gradient(loss_posterior_z, [self.data_z])
@@ -1110,6 +1126,41 @@ class BGM_IV(CausalBGM):
             print("Post-EGM encoder metrics:", self._format_training_record(record))
         print("EGM Initialization Ends.")
 
+    def _apply_bn_determinism(self):
+        """Force non-fused BatchNormalization under the determinism contract.
+
+        FusedBatchNormGradV3 has no deterministic GPU implementation, so with
+        ``deterministic_training`` every BatchNormalization layer must take
+        the non-fused path.  Must run BEFORE the layers are built (``fused``
+        is resolved at build time); fit() calls this ahead of training.
+        """
+        if not bool(self.params.get("deterministic_training", False)):
+            return
+        for attr in vars(self).values():
+            if isinstance(attr, tf.Module):
+                for layer in getattr(attr, "submodules", ()):
+                    if isinstance(layer, tf.keras.layers.BatchNormalization):
+                        layer.fused = False
+
+    def _outcome_to_particles_weight(self):
+        """Resolve gamma in [0, 1] for the outcome->particle coupling.
+
+        The particle objective is loss_pv_z + loss_prior_z + loss_px_z +
+        gamma * loss_py_z.  An explicit `outcome_to_particles_weight` wins;
+        otherwise the boolean alias `stop_outcome_to_particles` maps
+        True -> 0.0 (severed C-form) and False -> 1.0 (joint objective).
+        """
+        if "outcome_to_particles_weight" in self.params:
+            gamma = float(self.params["outcome_to_particles_weight"])
+            if not 0.0 <= gamma <= 1.0:
+                raise ValueError(
+                    "outcome_to_particles_weight must be in [0, 1]"
+                )
+            return gamma
+        if bool(self.params.get("stop_outcome_to_particles", False)):
+            return 0.0
+        return 1.0
+
     def fit(
         self,
         data,
@@ -1139,6 +1190,7 @@ class BGM_IV(CausalBGM):
             Number of epochs to train only ``p(v|z)`` and ``p(x|w,z)`` before
             switching on the IV outcome pseudo-likelihood.
         """
+        self._apply_bn_determinism()
         data_x, data_y, data_v, data_w = self._parse_train_data(data)
         if first_stage_warmup_epochs is None:
             first_stage_warmup_epochs = int(self.params["first_stage_warmup_epochs"])
@@ -1169,12 +1221,33 @@ class BGM_IV(CausalBGM):
             ).astype("float32")
 
         self.data_z = tf.Variable(data_z_init, name="Latent Variable", trainable=True)
+        # Register the particles in the checkpoint so trained particles are
+        # recoverable (attribute assignment adds the dependency to self.ckpt).
+        self.ckpt.data_z = self.data_z
+
+        if self.params.get("save_post_egm_checkpoint", False) and self.params["save_model"]:
+            # Ablation arm A: persist the PURE post-EGM state before any BGM
+            # update.  The regular per-epoch saves happen at epoch END and are
+            # rotated by max_to_keep, so no pure-EGM snapshot survives without
+            # this.  Pair with fit_epochs=0 + fit_first_stage_warmup_epochs=1
+            # so the loop neither trains with outcome nor overwrites this save.
+            post_egm_path = self.ckpt_manager.save(0)
+            print(f"Saving post-EGM checkpoint at {post_egm_path}")
 
         show_batch_progress = bool(self.params.get("fit_use_progress_bar", False)) and bool(verbose)
         print("Iterative Updating Starts ...")
         for epoch in range(epochs + 1):
             sample_idx = np.random.choice(len(data_x), len(data_x), replace=False)
             include_outcome = epoch >= first_stage_warmup_epochs
+            # Outcome->particle coupling gamma: the particle objective is
+            # loss_pv_z + loss_prior_z + loss_px_z + gamma * loss_py_z.
+            # gamma=0 severs ONLY the outcome->particle gradient path (C-form)
+            # while f keeps its outcome training (update_f_net stays gated by
+            # include_outcome alone); gamma=1 is the joint objective (B-form).
+            # EGM is untouched, so a deterministic same-seed run forks from an
+            # identical ckpt-0 at every gamma.
+            gamma = self._outcome_to_particles_weight()
+            particle_outcome = include_outcome and gamma > 0.0
 
             batch_iterator = range(0, len(data_x), batch_size)
             if show_batch_progress:
@@ -1212,7 +1285,7 @@ class BGM_IV(CausalBGM):
                         batch_v,
                         batch_w,
                         batch_idx,
-                        include_outcome=include_outcome,
+                        include_outcome=particle_outcome,
                     )
 
                     loss_contents = (

@@ -18,7 +18,9 @@ remaining applicable to low-dimensional covariates.
 - Nonlinear instrumental-variable regression under endogeneity
 - Latent Bayesian generative modeling for structured covariate representations
 - IV-integrated pseudo-likelihood for endogeneity correction
-- MAP structural prediction for point estimates
+- Structural prediction with MAP, encoder, and posterior-integration readouts
+- Reproducible benchmarks for low-dimensional, high-dimensional, and image
+  covariates
 
 ## Installation
 
@@ -60,6 +62,7 @@ This project is tested with:
 - `tensorflow==2.10.0`
 - `tensorflow-probability==0.18.0`
 - `numpy==1.24.2`
+- `scipy==1.13.1`
 - `pyyaml`
 - `tqdm`
 - `python-dateutil`
@@ -67,119 +70,17 @@ This project is tested with:
 For Linux GPU runs with TensorFlow 2.10, CUDA 11.2 and cuDNN 8.1 are the
 expected compatible runtime libraries.
 
-## Quickstart (Python API)
+## Running Experiments
 
-Below is a minimal API example that simulates demand-design IV data, trains
-BGM-IV, and evaluates MAP structural predictions. It does not require the
-source-repo `configs/` directory.
-
-```python
-import numpy as np
-from bgm_iv.datasets import make_demand_design_grid, simulate_demand_design_iv
-from bgm_iv.models import BGM_IV
-
-params = {
-    "dataset": "Sim_Demand_Design_IV",
-    "output_dir": ".",
-    "save_res": False,
-    "save_model": False,
-    "use_bnn": False,
-    "binary_treatment": False,
-    "n_samples": 128,
-    "rho": 0.5,
-    "fit_epochs": 1,
-    "fit_batch_size": 32,
-    "fit_egm_n_iter": 0,
-    "z_dims": [2, 2, 1, 2],
-    "v_dim": 2,
-    "w_dim": 1,
-    "g_units": [64, 64],
-    "f_units": [64, 32],
-    "h_units": [64, 32],
-    "e_units": [64, 64],
-    "dz_units": [64, 32],
-    "lr_theta": 1e-4,
-    "lr_z": 1e-4,
-    "lr": 2e-4,
-    "g_d_freq": 5,
-    "kl_weight": 1e-4,
-    "latent_pzv_weight": 0.5,
-    "use_z_rec": True,
-    "iv_mc_samples": 4,
-    "eval_mc_samples": 4,
-    "structural_map_steps": 5,
-    "structural_map_lr": 1e-4,
-    "seed": 0,
-}
-
-train = simulate_demand_design_iv(
-    n_samples=params["n_samples"],
-    rho=params["rho"],
-    seed=params["seed"],
-)
-grid = make_demand_design_grid(price_points=4, time_points=3)
-
-model = BGM_IV(params=params, random_seed=42)
-model.fit(
-    data=(train["x"], train["y"], train["v"], train["w"]),
-    epochs=params["fit_epochs"],
-    batch_size=params["fit_batch_size"],
-    use_egm_init=False,
-    verbose=0,
-)
-
-prediction = model.predict_structural(
-    grid["x"],
-    grid["v"],
-    latent_method="map",
-    map_steps=params["structural_map_steps"],
-)
-mse = np.mean((prediction - grid["y_struct"]) ** 2)
-print(f"Structural MSE: {mse:.4f}")
-```
-
-## Reproducing Experiments With `main.py`
-
-`main.py` is the primary source-repo experiment entrypoint. It reads a YAML
-configuration with `-c` and runs the requested demand-design IV benchmark.
-These benchmark configs are provided in the GitHub repository, not as the
-primary PyPI interface.
-
-Run all commands from the repository root:
+`main.py` is the source-repository experiment entrypoint. Run it from the
+repository root with one of the YAML configurations under `configs/`:
 
 ```bash
 python main.py -c configs/Sim_Demand_Design_IV.yaml -t 1
-python main.py -c configs/Sim_Demand_Design_Mnist_IV.yaml -t 1
-python main.py -c configs/Sim_Demand_Design_Vector_IV.yaml -t 1
 ```
 
-Use `-t x` to set the number of parallel workers for demand-design sweeps.
-
-### Provided configs
-
-- `configs/Sim_Demand_Design_IV.yaml`: low-dimensional airline-demand IV
-  benchmark with observed covariates `V=[time, customer_group]`.
-- `configs/Sim_Demand_Design_Mnist_IV.yaml`: MNIST image-covariate IV
-  benchmark with `V=[time, image_784]`; the current config uses `v_dim: 785`.
-- `configs/Sim_Demand_Design_Vector_IV.yaml`: high-dimensional vector-proxy IV
-  benchmark with a 784-dimensional proxy representation and
-  `representation_sd: 0.5`.
-
-For MNIST-HD, set `v_dim: 1000` in the MNIST config or in a copied config. This
-appends 215 iid Gaussian nuisance covariates after `[time, image_784]`.
-
-### What `main.py` does
-
-For each run:
-
-- Loads a YAML config
-- Simulates the requested demand-design benchmark and structural evaluation grid
-- Trains the appropriate BGM-IV model
-- Computes MAP structural predictions on the original outcome scale
-- Writes active logs and run summaries under ignored runtime directories
-
-Structural performance is reported as structural MSE on the original outcome
-scale using the same evaluation grid across methods.
+The YAML files cover the included low-dimensional, vector, and image
+benchmarks and are the authoritative source for experiment-specific settings.
 
 ## MNIST Cache
 
@@ -193,7 +94,11 @@ internet access, provide the cache file before running the MNIST config.
 ```text
 bgm_iv/
   datasets/        # demand, MNIST, and vector-proxy simulators
+  features/        # image-representation export and preprocessing
+  hashing.py       # SHA-256 digests shared by features/ and mcmc/
   models/          # BGM-IV model implementations
+  mcmc/            # certified posterior integration (target, sampler,
+                   # diagnostics, readout, certify)
   utils/           # data I/O helpers
   tests/           # focused BGM-IV tests
 configs/           # YAML configs for experiments
@@ -211,30 +116,10 @@ Runtime files are intentionally ignored by Git:
 - `data/`
 - checkpoints and result folders
 
-Running `main.py` creates `logs/` and `dumps/` automatically. Each run
-gets a dump root named with the benchmark slug and run start time:
-
-```text
-dumps/<dataset_slug>_<YYYY-MM-DD_HH-MM-SS-microseconds>/
-```
-
-For the provided configs, `<dataset_slug>` is one of
-`sim_demand_design_iv`, `sim_demand_design_mnist_iv`, or
-`sim_demand_design_vector_iv`. The dump root stores a config snapshot and one
-clean result file per benchmark setting:
-
-```text
-dumps/sim_demand_design_iv_2026-05-06_14-30-10-123456/
-  Sim_Demand_Design_IV.yaml
-  n_samples:<n>-rho:<rho>-v_dim:<v_dim>/
-    results.csv
-```
-
-The active markdown log is also recreated automatically:
-
-```text
-logs/outputs_dev_<dataset_slug>_active.md
-```
+`main.py` writes run directories under `dumps/`, including a configuration
+snapshot and result files for each benchmark setting. Summary metrics are
+stored in `results.csv`; MCMC runs also write `certified_results.csv` and
+per-repeat JSON records. Runtime logs are stored under `logs/`.
 
 ## Citation
 

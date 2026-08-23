@@ -225,11 +225,95 @@ def test_resolve_training_monitor_methods_defaults_to_structural_methods():
     assert monitor_method == "map"
 
 
+def test_structural_methods_accepts_encoder_and_mcmc():
+    params = {
+        "structural_methods": ["map", "encoder", "mcmc"],
+        "training_structural_methods": ["map"],
+        "training_structural_monitor_method": "map",
+        "structural_latent_method": "map",
+    }
+    assert main_module._resolve_structural_methods(params) == ("map", "encoder", "mcmc")
+    main_module._validate_map_only_structural_config(params)
+
+
+class _DummyStructuralModel:
+    def __init__(self):
+        self.called_methods = []
+
+    def predict_structural(self, grid_x, grid_v, latent_method):
+        self.called_methods.append(latent_method)
+        return np.zeros((len(grid_x), 1), dtype=np.float32)
+
+
+def test_structural_methods_reject_unknown_methods_and_require_map():
+    params = {"structural_methods": ["map", "hmc"]}
+    with pytest.raises(ValueError, match="supports"):
+        main_module._resolve_structural_methods(params)
+    params = {"structural_methods": ["encoder", "mcmc"]}
+    with pytest.raises(ValueError, match="must include 'map'"):
+        main_module._resolve_structural_methods(params)
+    with pytest.raises(ValueError, match="certification context"):
+        main_module._evaluate_structural_methods(
+            _DummyStructuralModel(),
+            np.zeros((3, 1), dtype=np.float32),
+            np.zeros((3, 2), dtype=np.float32),
+            np.zeros((3, 1), dtype=np.float32),
+            methods=("map", "mcmc"),
+        )
+
+
+def test_feature_dataset_defaults_derive_dimensions_from_pixel_v_dim():
+    params = {"dataset": "Sim_Demand_Design_Mnist_Feature_IV"}
+    main_module._apply_demand_design_benchmark_defaults(params)
+    assert params["pixel_v_dim"] == 785 and params["feature_map"] == "egm"
+    assert params["vector_dim"] == 64 and params["v_dim"] == 65
+    assert params["image_seed"] == 42 and params["holdout_seed_offset"] == 1000
+    hd = {"dataset": "Sim_Demand_Design_Mnist_Feature_IV", "pixel_v_dim": 1000}
+    main_module._apply_demand_design_benchmark_defaults(hd)
+    assert hd["vector_dim"] == 279 and hd["v_dim"] == 280
+    bad = {"dataset": "Sim_Demand_Design_Mnist_Feature_IV", "v_dim": 785}
+    with pytest.raises(ValueError, match="derived"):
+        main_module._apply_demand_design_benchmark_defaults(bad)
+    bad_map = {"dataset": "Sim_Demand_Design_Mnist_Feature_IV", "feature_map": "raw"}
+    with pytest.raises(ValueError, match="feature_map"):
+        main_module._apply_demand_design_benchmark_defaults(bad_map)
+
+
+def test_training_grid_monitor_switch_controls_the_callback():
+    params = {"structural_methods": ["map"], "training_grid_monitor": False}
+    assert main_module._maybe_structural_monitor_callback(
+        params, np.zeros((2, 1)), np.zeros((2, 2)), np.zeros((2, 1))
+    ) is None
+    params["training_grid_monitor"] = True
+    callback = main_module._maybe_structural_monitor_callback(
+        params, np.zeros((2, 1), np.float32), np.zeros((2, 2), np.float32), np.zeros((2, 1), np.float32)
+    )
+    metrics = callback(model=_DummyStructuralModel(), stage="epoch_eval", epoch=0, metrics={})
+    assert "structural_mse_map" in metrics
+
+
+def test_sweep_expands_gamma_axis_into_isolated_dirs(tmp_path):
+    params = {
+        "n_samples": 1000,
+        "rho": 0.5,
+        "n_repeat": 1,
+        "outcome_to_particles_weight": [0.0, 0.25],
+        "output_dir": str(tmp_path),
+        "save_model": True,
+        "save_res": False,
+        "v_dim": 2,
+    }
+    runs = list(main_module._iter_demand_design_sweep_runs(params))
+    assert [run["outcome_to_particles_weight"] for _, _, run in runs] == [0.0, 0.25]
+    assert all("__gamma=" in run["output_dir"] for _, _, run in runs)
+    names = {main_module._build_demand_design_combo_dir_name(run) for _, _, run in runs}
+    assert names == {"n_samples:1000-rho:0.5-v_dim:2-gamma:0", "n_samples:1000-rho:0.5-v_dim:2-gamma:0.25"}
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
         ("structural_methods", ["encoder"]),
-        ("structural_methods", ["mc" + "mc"]),
         ("structural_methods", [""]),
         ("training_structural_methods", ["encoder"]),
         ("training_structural_monitor_method", "encoder"),
@@ -354,6 +438,18 @@ def test_print_demand_design_run_config(capsys):
     assert "w_dim: 1" in captured
 
 
+def test_set_overrides_parse_yaml_values_and_apply_in_order():
+    parser = main_module._build_arg_parser()
+    args = parser.parse_args(
+        ["-c", "x.yaml", "--set", "n_samples=5000", "--set", "rho=0.5",
+         "--set", "structural_methods=[map, mcmc]", "--set", "n_samples=1000"]
+    )
+    params = main_module._apply_config_overrides({"n_samples": [1, 2], "seed": 3}, args.overrides)
+    assert params == {"n_samples": 1000, "rho": 0.5, "structural_methods": ["map", "mcmc"], "seed": 3}
+    with pytest.raises(ValueError, match="KEY=VALUE"):
+        main_module._apply_config_overrides({}, ["n_samples"])
+
+
 def test_build_arg_parser_accepts_num_tasks():
     parser = main_module._build_arg_parser()
     args = parser.parse_args(["-c", "configs/Sim_Demand_Design_IV.yaml", "-t", "5"])
@@ -425,6 +521,8 @@ def test_run_demand_design_family_parallel_flushes_results_in_run_order(
         run_config_text,
         ranges_text,
         training_history,
+        final_results=None,
+        provenance=None,
     ):
         persisted.append((run_index, params["repeat_id"], run_config_text))
 
@@ -752,15 +850,6 @@ def test_demand_design_repeat_id_changes_train_data_but_not_grid_data():
     np.testing.assert_allclose(grid_0["y_struct"], grid_1["y_struct"], atol=0.0)
 
 
-class _DummyStructuralModel:
-    def __init__(self):
-        self.called_methods = []
-
-    def predict_structural(self, grid_x, grid_v, latent_method):
-        self.called_methods.append(latent_method)
-        return np.zeros((len(grid_x), 1), dtype=np.float32)
-
-
 def test_training_structural_methods_limit_training_callback_but_not_final_summary():
     params = {
         "structural_methods": ["map"],
@@ -943,9 +1032,18 @@ def test_persist_demand_design_repeat_outputs_writes_expected_files(tmp_path):
 
     assert sorted(path.name for path in combo_dir.iterdir()) == ["results.csv"]
 
-    lines = (combo_dir / "results.csv").read_text(encoding="utf-8").splitlines()
-    assert lines[0] == "repeat_id,method,stage,epoch,include_outcome,mse_x,mse_y,mse_v,structural_mse"
-    assert lines[1] == "1,map,epoch_eval,10,True,0.2,0.1,0.05,8.0"
+    import csv as _csv
+
+    with (combo_dir / "results.csv").open(encoding="utf-8") as handle:
+        rows = list(_csv.DictReader(handle))
+    assert list(rows[0].keys()) == list(main_module._FINAL_RESULT_COLUMNS)
+    assert rows[0]["repeat_id"] == "1"
+    assert rows[0]["stage"] == "epoch_eval"
+    assert rows[0]["epoch"] == "10"
+    assert rows[0]["structural_mse_map"] == "8.0"
+    assert rows[0]["structural_mse_mcmc"] == ""
+    assert rows[0]["structural_mse_encoder"] == ""
+    assert "structural_mse_map_recert" not in rows[0]
 
 
 def test_render_demand_design_active_window_omits_updated_at_and_run_id(tmp_path):
@@ -969,7 +1067,7 @@ def test_render_demand_design_active_window_omits_updated_at_and_run_id(tmp_path
     assert "updated_at" not in content
     assert "run_id" not in content
     assert "- target: `bgm_iv`" in content
-    assert "## Driver Output" in content
+    assert "## Run Output" in content
     assert "hello" in content
 
 
@@ -1125,3 +1223,91 @@ def test_egm_integral_grad_path_stop_runs_and_diverges(tmp_path):
         not np.isclose(float(a.numpy()), float(b.numpy()), rtol=1e-6)
         for a, b in zip(outs_mean, outs_stop)
     )
+
+
+def _manifest_model_params(tmp_path):
+    return {
+        "dataset": "Sim_Demand_Design_IV",
+        "output_dir": str(tmp_path),
+        "save_res": False,
+        "save_model": True,
+        "binary_treatment": False,
+        "use_bnn": False,
+        "z_dims": [1, 1, 1, 1],
+        "v_dim": 2,
+        "w_dim": 1,
+        "lr_theta": 5e-4,
+        "lr_z": 5e-4,
+        "g_units": [8, 8],
+        "e_units": [8, 8],
+        "f_units": [8, 4],
+        "h_units": [8, 4],
+        "dz_units": [8, 4],
+        "kl_weight": 0.0,
+        "lr": 5e-4,
+        "g_d_freq": 1,
+        "use_z_rec": True,
+        "iv_mc_samples": 2,
+        "eval_mc_samples": 2,
+        "first_stage_warmup_epochs": 0,
+        "structural_methods": ["map"],
+    }
+
+
+def test_training_manifest_binds_checkpoint_params_and_data(tmp_path):
+    params = _manifest_model_params(tmp_path)
+    rng = np.random.default_rng(0)
+    train = {
+        "x": rng.normal(size=(6, 1)).astype(np.float32),
+        "y": rng.normal(size=(6, 1)).astype(np.float32),
+        "v": rng.normal(size=(6, 2)).astype(np.float32),
+        "w": rng.normal(size=(6, 1)).astype(np.float32),
+    }
+    model = BGM_IV(params=params, random_seed=main_module._model_random_seed(params))
+    model.ckpt_manager.save(0)
+    manifest = main_module._write_training_manifest(model, params, train)
+    path = Path(model.checkpoint_path) / "manifest.json"
+    assert path.exists()
+    assert manifest["checkpoint_identity"] == main_module._checkpoint_identity(model)
+    assert set(manifest["data"]) == {"x", "y", "v", "w"}
+    assert "output_dir" not in manifest["params"] and "lr" in manifest["params"]
+    # a second write for the same checkpoint must agree
+    assert main_module._write_training_manifest(model, params, train) == manifest
+    with pytest.raises(RuntimeError, match="differs"):
+        main_module._write_training_manifest(model, params, {**train, "y": train["y"] + 1.0})
+
+    restored = main_module._restore_demand_design_model(params, model.timestamp, train=train)
+    assert main_module._checkpoint_identity(restored) == manifest["checkpoint_identity"]
+    # run-control keys are not part of the contract
+    main_module._restore_demand_design_model(
+        {**params, "structural_methods": ["map", "mcmc"]}, model.timestamp, train=train
+    )
+    with pytest.raises(RuntimeError, match="data"):
+        main_module._restore_demand_design_model(
+            params, model.timestamp, train={**train, "y": train["y"] + 1.0}
+        )
+    with pytest.raises(RuntimeError, match="lr"):
+        main_module._restore_demand_design_model({**params, "lr": 1e-3}, model.timestamp, train=train)
+    with pytest.raises(RuntimeError, match="extra"):
+        main_module._restore_demand_design_model(
+            params, model.timestamp, train=train, manifest_extra={"pixel_stage": {"timestamp": "x"}}
+        )
+    path.unlink()
+    with pytest.raises(FileNotFoundError, match="manifest"):
+        main_module._restore_demand_design_model(params, model.timestamp, train=train)
+
+
+def test_holdout_criterion_uses_observed_outcome_and_instrument(tmp_path):
+    params = _manifest_model_params(tmp_path)
+    params["save_model"] = False
+    model = BGM_IV(params=params, random_seed=5)
+    rng = np.random.default_rng(1)
+    holdout = {
+        "v": rng.normal(size=(5, 2)).astype(np.float32),
+        "w": rng.normal(size=(5, 1)).astype(np.float32),
+        "y": rng.normal(size=(5, 1)).astype(np.float32),
+    }
+    out = main_module._evaluate_holdout_criterion(model, holdout)
+    assert set(out) == {"holdout_iv_mse_map", "holdout_iv_mse_encoder"}
+    assert all(np.isfinite(v) and v >= 0 for v in out.values())
+
