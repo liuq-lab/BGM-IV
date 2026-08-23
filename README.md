@@ -30,14 +30,14 @@ remaining applicable to low-dimensional covariates.
 In addition to point prediction, BGM-IV can average the structural outcome
 network over draws from the fitted latent posterior,
 
-$$
+```math
 \widehat g(x,v)
 =
 \frac{1}{M}\sum_{m=1}^{M}
 \mu_{\widehat\omega}\!\left(x,z_Y^{(m)}\right),
 \qquad
 z^{(m)}\sim p_{\widehat\theta}(z\mid v).
-$$
+```
 
 This propagates latent-state uncertainty into posterior-integrated structural
 estimates and outcome predictive intervals. The MCMC pipeline uses multiple
