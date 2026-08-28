@@ -33,6 +33,7 @@ setup(
     include_package_data=False,
     install_requires=[
         "numpy==1.24.2",
+        "scipy==1.13.1",
         "tensorflow==2.10.0",
         "tensorflow-probability==0.18.0",
         "pyyaml",

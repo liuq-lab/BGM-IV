@@ -42,7 +42,6 @@ def _make_vector_params(output_dir):
         "eval_mc_samples": 2,
         "first_stage_warmup_epochs": 0,
         "structural_map_steps": 2,
-        "latent_pzv_weight": 0.5,
     }
 
 
@@ -121,7 +120,10 @@ def test_vector_covariate_posterior_is_untempered(tmp_path):
         dtype=tf.float32,
     )
 
-    loss_pv_z, _, _ = model._covariate_loss_terms(data_v, data_z, training=False)
+    loss_pv_z, _, _ = model._covariate_loss_terms(
+        data_v, data_z, training=False,
+        block_scale=str(model.params["covariate_block_scale"]),
+    )
     loss_prior_z = tf.reduce_sum(data_z ** 2, axis=1) / 2.0
     expected = -(loss_pv_z + loss_prior_z)
     actual = model.get_log_covariate_posterior(data_v, data_z)

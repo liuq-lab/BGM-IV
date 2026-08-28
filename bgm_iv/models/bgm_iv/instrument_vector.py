@@ -79,9 +79,94 @@ class BGM_IV_Vector(BGM_IV):
         return time, vector
 
     def _decode_covariates(self, data_z, training=True):
-        return self.g_net(data_z, training=training)
+        decoded = self.g_net(data_z, training=training)
+        if "sigma_time_softfloor" in self.params:
+            # Soft variance floor: keep the head
+            # LEARNABLE but bounded below — sigma = sigma_min + sigma_learned,
+            # where sigma_learned = sqrt(learned softplus-positive variance).
+            # Unlike the fixed override, gradients keep flowing to the head;
+            # unlike the raw head, the MLE cannot collapse below sigma_min.
+            if "sigma_time" in self.params:
+                raise ValueError(
+                    "sigma_time and sigma_time_softfloor are mutually exclusive"
+                )
+            decoded = dict(decoded)
+            sigma_min = tf.cast(
+                float(self.params["sigma_time_softfloor"]), tf.float32
+            )
+            decoded["time_var"] = tf.square(
+                sigma_min + tf.sqrt(decoded["time_var"])
+            )
+        elif "sigma_time" in self.params:
+            # Fixed time-observation noise (mirrors the demand ``sigma_v``
+            # override): keeps the time variance head from collapsing, which
+            # destabilizes latent gradients and makes the covariate posterior
+            # unsamplable.  Applied once here so training and inference agree.
+            decoded = dict(decoded)
+            decoded["time_var"] = tf.ones_like(decoded["time_var"]) * tf.cast(
+                float(self.params["sigma_time"]) ** 2, tf.float32
+            )
+        if "sigma_vector_softfloor" in self.params:
+            # Soft variance floor on the vector block, same construction as
+            # sigma_time_softfloor: the head stays trainable and sigma cannot
+            # collapse below sigma_min on low-rank image representations. A scalar
+            # floors every dimension; a per-block list (``vector_blocks``)
+            # floors each contiguous block with its own sigma_min (MNIST-HD:
+            # phi / raw nuisance noise).
+            if "sigma_vector" in self.params:
+                raise ValueError(
+                    "sigma_vector and sigma_vector_softfloor are mutually exclusive"
+                )
+            decoded = dict(decoded)
+            decoded["vector_var"] = tf.square(
+                self._vector_softfloor_sigma_min() + tf.sqrt(decoded["vector_var"])
+            )
+        elif "sigma_vector" in self.params:
+            # Fixed vector-observation noise (mirror of the fixed ``sigma_time``
+            # override).
+            decoded = dict(decoded)
+            decoded["vector_var"] = tf.ones_like(decoded["vector_var"]) * tf.cast(
+                float(self.params["sigma_vector"]) ** 2, tf.float32
+            )
+        return decoded
 
-    def _covariate_loss_terms(self, data_v, data_z, training=True):
+    def _vector_block_sizes(self):
+        """Contiguous block sizes of the vector covariate (sum == vector_dim)."""
+        blocks = self.params.get("vector_blocks")
+        if blocks is None:
+            return (int(self.vector_dim),)
+        blocks = tuple(int(value) for value in blocks)
+        if any(value <= 0 for value in blocks) or sum(blocks) != int(self.vector_dim):
+            raise ValueError(
+                "`vector_blocks` must be positive sizes summing to vector_dim"
+            )
+        return blocks
+
+    def _vector_softfloor_sigma_min(self):
+        """sigma_min row vector [1, vector_dim] for the vector soft floor."""
+        floor = self.params["sigma_vector_softfloor"]
+        blocks = self._vector_block_sizes()
+        if isinstance(floor, (list, tuple)):
+            if len(floor) != len(blocks):
+                raise ValueError(
+                    "`sigma_vector_softfloor` list length must match `vector_blocks`"
+                )
+            values = [float(value) for value in floor]
+        else:
+            values = [float(floor)] * len(blocks)
+        if any(value < 0.0 for value in values):
+            raise ValueError("`sigma_vector_softfloor` entries must be non-negative")
+        row = tf.concat(
+            [
+                tf.fill((1, int(size)), tf.cast(value, tf.float32))
+                for size, value in zip(blocks, values)
+            ],
+            axis=1,
+        )
+        return row
+
+    def _covariate_loss_terms(self, data_v, data_z, training=True,
+                              block_scale="sum"):
         time_obs, vector_obs = self._split_public_covariates(data_v)
         decoded = self._decode_covariates(data_z, training=training)
 
@@ -95,7 +180,10 @@ class BGM_IV_Vector(BGM_IV):
             + 0.5 * tf.math.log(time_var),
             axis=1,
         )
-        vector_nll = tf.reduce_mean(
+        vector_block_reduce = (
+            tf.reduce_sum if block_scale == "sum" else tf.reduce_mean
+        )
+        vector_nll = vector_block_reduce(
             ((vector_obs - vector_mean) ** 2) / (2.0 * vector_var)
             + 0.5 * tf.math.log(vector_var),
             axis=1,
@@ -117,7 +205,8 @@ class BGM_IV_Vector(BGM_IV):
         del eps
         with tf.GradientTape() as gen_tape:
             loss_terms, loss_mse, _ = self._covariate_loss_terms(
-                data_v, data_z, training=True
+                data_v, data_z, training=True,
+                block_scale=str(self.params["covariate_block_scale"]),
             )
             loss_v = tf.reduce_mean(loss_terms)
             if self.params["use_bnn"]:
@@ -136,7 +225,8 @@ class BGM_IV_Vector(BGM_IV):
             data_z = tf.gather(self.data_z, batch_idx, axis=0)
 
             loss_pv_z, _, _ = self._covariate_loss_terms(
-                data_v, data_z, training=True
+                data_v, data_z, training=True,
+                block_scale=str(self.params["covariate_block_scale"]),
             )
             loss_pv_z = tf.reduce_mean(loss_pv_z)
 
@@ -166,11 +256,9 @@ class BGM_IV_Vector(BGM_IV):
                 loss_py_z = tf.constant(0.0, dtype=tf.float32)
 
             loss_prior_z = tf.reduce_mean(tf.reduce_sum(data_z ** 2, axis=1) / 2.0)
-            latent_pzv_weight = tf.cast(self.params["latent_pzv_weight"], tf.float32)
             loss_posterior_z = (
-                latent_pzv_weight * (loss_pv_z + loss_prior_z)
-                + loss_px_z
-                + loss_py_z
+                loss_pv_z + loss_prior_z + loss_px_z
+                + self._outcome_to_particles_weight() * loss_py_z
             )
 
         posterior_gradients = tape.gradient(loss_posterior_z, [self.data_z])
@@ -420,6 +508,11 @@ class BGM_IV_Vector(BGM_IV):
     @tf.function
     def get_log_covariate_posterior(self, data_v, data_z, eps=1e-6):
         del eps
-        loss_pv_z, _, _ = self._covariate_loss_terms(data_v, data_z, training=False)
+        loss_pv_z, _, _ = self._covariate_loss_terms(
+            data_v,
+            data_z,
+            training=False,
+            block_scale=str(self.params.get("covariate_block_scale", "sum")),
+        )
         loss_prior_z = tf.reduce_sum(data_z ** 2, axis=1) / 2.0
         return -(loss_pv_z + loss_prior_z)

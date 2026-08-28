@@ -31,6 +31,15 @@ class BGM_IV_Image(BGM_IV):
             name="g_net",
         )
         self.initialize_nets()
+        # Determinism contract: the image decoder is the only BGM-IV network
+        # with BatchNormalization, and FusedBatchNormGradV3 has no
+        # deterministic GPU kernel.  Flip every BN layer to the non-fused
+        # path right after the eager build and BEFORE the checkpoint restore
+        # / any tf.function trace, so restore-path consumers (MCMC inference
+        # and feature export) get the same numerics as training
+        # without having to remember a manual call.  fit() re-applies it as
+        # an idempotent guard.
+        self._apply_bn_determinism()
 
         self.ckpt = tf.train.Checkpoint(
             g_net=self.g_net,
@@ -80,9 +89,35 @@ class BGM_IV_Image(BGM_IV):
         return time, image_raw, image_norm, noise
 
     def _decode_covariates(self, data_z, training=True):
-        return self.g_net(data_z, training=training)
+        decoded = self.g_net(data_z, training=training)
+        if "sigma_time_softfloor" in self.params:
+            # Soft variance floor: keep the head
+            # LEARNABLE but bounded below — sigma = sigma_min + sigma_learned,
+            # where sigma_learned = sqrt(learned softplus-positive variance).
+            # Unlike the fixed override, gradients keep flowing to the head;
+            # unlike the raw head, the MLE cannot collapse below sigma_min.
+            if "sigma_time" in self.params:
+                raise ValueError(
+                    "sigma_time and sigma_time_softfloor are mutually exclusive"
+                )
+            decoded = dict(decoded)
+            sigma_min = tf.cast(
+                float(self.params["sigma_time_softfloor"]), tf.float32
+            )
+            decoded["time_var"] = tf.square(
+                sigma_min + tf.sqrt(decoded["time_var"])
+            )
+        elif "sigma_time" in self.params:
+            # Fixed time-observation noise (mirrors the demand ``sigma_v``
+            # override); see instrument_vector._decode_covariates.
+            decoded = dict(decoded)
+            decoded["time_var"] = tf.ones_like(decoded["time_var"]) * tf.cast(
+                float(self.params["sigma_time"]) ** 2, tf.float32
+            )
+        return decoded
 
-    def _covariate_loss_terms(self, data_v, data_z, training=True):
+    def _covariate_loss_terms(self, data_v, data_z, training=True,
+                              block_scale="sum"):
         time_obs, _, image_obs, noise_obs = self._split_public_covariates(data_v)
         decoded = self._decode_covariates(data_z, training=training)
 
@@ -98,7 +133,10 @@ class BGM_IV_Image(BGM_IV):
             + 0.5 * tf.math.log(time_var),
             axis=1,
         )
-        image_nll = tf.reduce_mean(
+        block_reduce = (
+            tf.reduce_sum if block_scale == "sum" else tf.reduce_mean
+        )
+        image_nll = block_reduce(
             tf.nn.sigmoid_cross_entropy_with_logits(
                 labels=image_obs,
                 logits=image_logits,
@@ -110,7 +148,7 @@ class BGM_IV_Image(BGM_IV):
         loss_terms = [time_nll, image_nll]
         mse_terms = [mse_time, mse_image]
         if self.extra_noise_dim > 0:
-            noise_nll = tf.reduce_mean(
+            noise_nll = block_reduce(
                 ((noise_obs - noise_mean) ** 2) / (2.0 * noise_var)
                 + 0.5 * tf.math.log(noise_var),
                 axis=1,
@@ -138,7 +176,8 @@ class BGM_IV_Image(BGM_IV):
         del eps
         with tf.GradientTape() as gen_tape:
             loss_terms, loss_mse, _ = self._covariate_loss_terms(
-                data_v, data_z, training=True
+                data_v, data_z, training=True,
+                block_scale=str(self.params["covariate_block_scale"]),
             )
             loss_v = tf.reduce_mean(loss_terms)
             if self.params["use_bnn"]:
@@ -157,7 +196,8 @@ class BGM_IV_Image(BGM_IV):
             data_z = tf.gather(self.data_z, batch_idx, axis=0)
 
             loss_pv_z, _, _ = self._covariate_loss_terms(
-                data_v, data_z, training=True
+                data_v, data_z, training=True,
+                block_scale=str(self.params["covariate_block_scale"]),
             )
             loss_pv_z = tf.reduce_mean(loss_pv_z)
 
@@ -187,11 +227,9 @@ class BGM_IV_Image(BGM_IV):
                 loss_py_z = tf.constant(0.0, dtype=tf.float32)
 
             loss_prior_z = tf.reduce_mean(tf.reduce_sum(data_z ** 2, axis=1) / 2.0)
-            latent_pzv_weight = tf.cast(self.params["latent_pzv_weight"], tf.float32)
             loss_posterior_z = (
-                latent_pzv_weight * (loss_pv_z + loss_prior_z)
-                + loss_px_z
-                + loss_py_z
+                loss_pv_z + loss_prior_z + loss_px_z
+                + self._outcome_to_particles_weight() * loss_py_z
             )
 
         posterior_gradients = tape.gradient(loss_posterior_z, [self.data_z])
@@ -439,6 +477,11 @@ class BGM_IV_Image(BGM_IV):
     @tf.function
     def get_log_covariate_posterior(self, data_v, data_z, eps=1e-6):
         del eps
-        loss_pv_z, _, _ = self._covariate_loss_terms(data_v, data_z, training=False)
+        loss_pv_z, _, _ = self._covariate_loss_terms(
+            data_v,
+            data_z,
+            training=False,
+            block_scale=str(self.params.get("covariate_block_scale", "sum")),
+        )
         loss_prior_z = tf.reduce_sum(data_z ** 2, axis=1) / 2.0
         return -(loss_pv_z + loss_prior_z)

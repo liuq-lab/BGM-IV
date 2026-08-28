@@ -1,3 +1,8 @@
 [build-system]
 requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+markers = [
+  "slow: compiled HMC or end-to-end smoke tests",
+]

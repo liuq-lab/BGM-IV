@@ -83,7 +83,6 @@ def _make_image_params(output_dir):
         "eval_mc_samples": 2,
         "first_stage_warmup_epochs": 0,
         "structural_map_steps": 2,
-        "latent_pzv_weight": 0.5,
     }
 
 
@@ -283,7 +282,10 @@ def test_image_covariate_posterior_is_untempered(fake_mnist, tmp_path):
     params = _make_image_params(tmp_path)
     model = BGM_IV_Image(params=params, random_seed=5)
 
-    loss_pv_z, _, _ = model._covariate_loss_terms(data_v, data_z, training=False)
+    loss_pv_z, _, _ = model._covariate_loss_terms(
+        data_v, data_z, training=False,
+        block_scale=str(model.params["covariate_block_scale"]),
+    )
     loss_prior_z = tf.reduce_sum(data_z ** 2, axis=1) / 2.0
     expected = -(loss_pv_z + loss_prior_z)
     actual = model.get_log_covariate_posterior(data_v, data_z)
@@ -305,7 +307,6 @@ def test_mnist_runner_helpers_use_mnist_slug():
         "z_dims": [2, 1, 1, 7],
         "v_dim": 1000,
         "w_dim": 1,
-        "latent_pzv_weight": 0.5,
     }
 
     text = main_module._render_demand_design_run_config(params)

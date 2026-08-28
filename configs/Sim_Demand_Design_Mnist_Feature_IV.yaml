@@ -1,0 +1,63 @@
+dataset: Sim_Demand_Design_Mnist_Feature_IV
+output_dir: "."
+save_res: False
+save_model: True
+use_gpu: True
+binary_treatment: False
+use_bnn: False
+n_samples: [1000,5000,10000]
+rho: [0.1,0.25,0.5,0.75,0.9]
+n_repeat: 20
+# MNIST demand design with a learned image representation.
+# Representation preprocessing is fitted from training data only.
+pixel_v_dim: 785                 # 1000 for the MNIST-HD variant (215 nuisance dims)
+feature_map: egm                 # egm = encoder representation; pca = PCA-64 control
+vector_dim: 64
+v_dim: 65
+# Optional image-encoder checkpoint reuse; set both fields together.
+pixel_checkpoint_dir: null
+pixel_checkpoint_timestamp: null
+pixel_fit_epochs: 200
+pixel_fit_batch_size: 32
+pixel_fit_egm_n_iter: 50000
+pixel_z_dims: [2,1,1,2]
+# --- stage-2 vector recipe ---------------------------------------------------
+fit_epochs: 200
+fit_epochs_per_eval: 10
+fit_batch_size: 32
+fit_egm_n_iter: 50000
+fit_egm_batches_per_eval: 500
+fit_first_stage_warmup_epochs: 0
+z_dims: [2,1,1,2]
+lr_theta: 0.0001
+lr_z: 0.0001
+g_units: [64,64,64,64,64]
+f_units: [64,32,8]
+h_units: [64,32,8]
+e_units: [64,64,64,64,64]
+dz_units: [64,32,8]
+kl_weight: 0.0001
+lr: 0.0002
+g_d_freq: 5
+use_z_rec: True
+iv_mc_samples: 1000
+eval_mc_samples: 1000
+structural_map_steps: 1000
+structural_map_lr: 0.0001
+# gamma: selected by the training-side held-out criterion
+outcome_to_particles_weight: 0.25
+sigma_time_softfloor: 0.1
+sigma_y_softfloor: 0.1
+# "rule" estimates a label-free floor from held-out training data.
+sigma_vector_softfloor: rule
+sigma_vector_softfloor_rule_factor: 0.5
+sigma_vector_softfloor_min: 0.02
+# MNIST-HD nuisance-block floor.
+sigma_noise_softfloor: 0.1
+holdout_seed_offset: 1000
+holdout_n_samples: null          # null -> same n as training
+deterministic_training: true
+training_grid_monitor: false
+# --- structural evaluation --------------------------------------------------
+structural_methods: [map, encoder, mcmc]
+mcmc_family: mnist_feature

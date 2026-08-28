@@ -8,6 +8,8 @@ when treatment assignment is endogenous and valid instruments are available. It
 learns a causally structured latent representation of covariates and replaces
 the confounded outcome likelihood with an IV-integrated pseudo-likelihood
 so that outcome learning is driven by instrument-induced treatment variation.
+It also supports MCMC integration over the latent covariate posterior for
+uncertainty-aware structural prediction.
 
 This design is intended for nonlinear IV settings where useful causal
 information may be embedded in high-dimensional or noisy covariates, while
@@ -18,7 +20,32 @@ remaining applicable to low-dimensional covariates.
 - Nonlinear instrumental-variable regression under endogeneity
 - Latent Bayesian generative modeling for structured covariate representations
 - IV-integrated pseudo-likelihood for endogeneity correction
-- MAP structural prediction for point estimates
+- Structural prediction with MAP, encoder, and posterior-integration readouts
+- Uncertainty quantification through multi-chain latent-posterior MCMC
+- Reproducible benchmarks for low-dimensional, high-dimensional, and image
+  covariates
+
+## Uncertainty Quantification
+
+In addition to point prediction, BGM-IV can average the structural outcome
+network over draws from the fitted latent posterior,
+
+```math
+\widehat g(x,v)
+=
+\frac{1}{M}\sum_{m=1}^{M}
+\mu_{\widehat\omega}\!\left(x,z_Y^{(m)}\right),
+\qquad
+z^{(m)}\sim p_{\widehat\theta}(z\mid v).
+```
+
+This propagates latent-state uncertainty into posterior-integrated structural
+estimates and outcome predictive intervals. Four overdispersed HMC chains are
+run over the complete target catalog. Structural MSE, 50/80/95% coverage and
+the corresponding 50/80/95% interval lengths use every post-warmup draw and
+every evaluation-grid query.
+These summaries are conditional on the fitted networks; they quantify latent
+and predictive uncertainty rather than a full posterior over network weights.
 
 ## Installation
 
@@ -60,6 +87,7 @@ This project is tested with:
 - `tensorflow==2.10.0`
 - `tensorflow-probability==0.18.0`
 - `numpy==1.24.2`
+- `scipy==1.13.1`
 - `pyyaml`
 - `tqdm`
 - `python-dateutil`
@@ -67,119 +95,48 @@ This project is tested with:
 For Linux GPU runs with TensorFlow 2.10, CUDA 11.2 and cuDNN 8.1 are the
 expected compatible runtime libraries.
 
-## Quickstart (Python API)
+## Running Experiments
 
-Below is a minimal API example that simulates demand-design IV data, trains
-BGM-IV, and evaluates MAP structural predictions. It does not require the
-source-repo `configs/` directory.
-
-```python
-import numpy as np
-from bgm_iv.datasets import make_demand_design_grid, simulate_demand_design_iv
-from bgm_iv.models import BGM_IV
-
-params = {
-    "dataset": "Sim_Demand_Design_IV",
-    "output_dir": ".",
-    "save_res": False,
-    "save_model": False,
-    "use_bnn": False,
-    "binary_treatment": False,
-    "n_samples": 128,
-    "rho": 0.5,
-    "fit_epochs": 1,
-    "fit_batch_size": 32,
-    "fit_egm_n_iter": 0,
-    "z_dims": [2, 2, 1, 2],
-    "v_dim": 2,
-    "w_dim": 1,
-    "g_units": [64, 64],
-    "f_units": [64, 32],
-    "h_units": [64, 32],
-    "e_units": [64, 64],
-    "dz_units": [64, 32],
-    "lr_theta": 1e-4,
-    "lr_z": 1e-4,
-    "lr": 2e-4,
-    "g_d_freq": 5,
-    "kl_weight": 1e-4,
-    "latent_pzv_weight": 0.5,
-    "use_z_rec": True,
-    "iv_mc_samples": 4,
-    "eval_mc_samples": 4,
-    "structural_map_steps": 5,
-    "structural_map_lr": 1e-4,
-    "seed": 0,
-}
-
-train = simulate_demand_design_iv(
-    n_samples=params["n_samples"],
-    rho=params["rho"],
-    seed=params["seed"],
-)
-grid = make_demand_design_grid(price_points=4, time_points=3)
-
-model = BGM_IV(params=params, random_seed=42)
-model.fit(
-    data=(train["x"], train["y"], train["v"], train["w"]),
-    epochs=params["fit_epochs"],
-    batch_size=params["fit_batch_size"],
-    use_egm_init=False,
-    verbose=0,
-)
-
-prediction = model.predict_structural(
-    grid["x"],
-    grid["v"],
-    latent_method="map",
-    map_steps=params["structural_map_steps"],
-)
-mse = np.mean((prediction - grid["y_struct"]) ** 2)
-print(f"Structural MSE: {mse:.4f}")
-```
-
-## Reproducing Experiments With `main.py`
-
-`main.py` is the primary source-repo experiment entrypoint. It reads a YAML
-configuration with `-c` and runs the requested demand-design IV benchmark.
-These benchmark configs are provided in the GitHub repository, not as the
-primary PyPI interface.
-
-Run all commands from the repository root:
+`main.py` is the source-repository experiment entrypoint. Run it from the
+repository root with one of the YAML configurations under `configs/`:
 
 ```bash
 python main.py -c configs/Sim_Demand_Design_IV.yaml -t 1
-python main.py -c configs/Sim_Demand_Design_Mnist_IV.yaml -t 1
-python main.py -c configs/Sim_Demand_Design_Vector_IV.yaml -t 1
 ```
 
-Use `-t x` to set the number of parallel workers for demand-design sweeps.
+A configuration may define a Cartesian-product sweep. The vector configuration
+contains 3 sample sizes, 5 values of `rho`, and 20 repeats. Scalar `--set`
+overrides collapse only the named axes; unspecified axes remain active. Using
+`configs/Sim_Demand_Design_Vector_IV.yaml`, the common cases are:
 
-### Provided configs
+| Additional arguments | Concrete runs |
+| --- | ---: |
+| `-t 1` | 300, sequentially |
+| `--set n_samples=5000 -t 2` | 100; all 5 values of `rho` and 20 repeats, at most 2 concurrently |
+| `--set n_samples=5000 --set rho=0.5 -t 1` | 20 repeats, sequentially |
+| `--set n_samples=5000 --repeat-id 0 -t 1` | 5; repeat 0 at every value of `rho` |
+| `--set n_samples=5000 --set rho=0.5 --repeat-id 0 -t 1` | 1 |
 
-- `configs/Sim_Demand_Design_IV.yaml`: low-dimensional airline-demand IV
-  benchmark with observed covariates `V=[time, customer_group]`.
-- `configs/Sim_Demand_Design_Mnist_IV.yaml`: MNIST image-covariate IV
-  benchmark with `V=[time, image_784]`; the current config uses `v_dim: 785`.
-- `configs/Sim_Demand_Design_Vector_IV.yaml`: high-dimensional vector-proxy IV
-  benchmark with a 784-dimensional proxy representation and
-  `representation_sd: 0.5`.
+For example, the second case is:
 
-For MNIST-HD, set `v_dim: 1000` in the MNIST config or in a copied config. This
-appends 215 iid Gaussian nuisance covariates after `[time, image_784]`.
+```bash
+python main.py -c configs/Sim_Demand_Design_Vector_IV.yaml \
+  --set n_samples=5000 -t 2
+```
 
-### What `main.py` does
+`-t N` changes only the maximum concurrency, not the number of runs. When
+`use_gpu: true`, each worker requires a distinct visible GPU. `--repeat-id`
+accepts one integer in `0, ..., n_repeat - 1`, requires `-t 1`, and applies to
+every sweep-axis combination that remains active.
 
-For each run:
+To restore a saved training checkpoint and run only structural evaluation and
+MCMC inference:
 
-- Loads a YAML config
-- Simulates the requested demand-design benchmark and structural evaluation grid
-- Trains the appropriate BGM-IV model
-- Computes MAP structural predictions on the original outcome scale
-- Writes active logs and run summaries under ignored runtime directories
-
-Structural performance is reported as structural MSE on the original outcome
-scale using the same evaluation grid across methods.
+```bash
+python main.py -c configs/Sim_Demand_Design_Mnist_IV.yaml \
+  --set n_samples=5000 --set rho=0.5 --repeat-id 0 \
+  --mcmc-only TIMESTAMP -t 1
+```
 
 ## MNIST Cache
 
@@ -193,7 +150,10 @@ internet access, provide the cache file before running the MNIST config.
 ```text
 bgm_iv/
   datasets/        # demand, MNIST, and vector-proxy simulators
+  features/        # image-representation export and preprocessing
+  hashing.py       # SHA-256 digests shared by features/ and mcmc/
   models/          # BGM-IV model implementations
+  mcmc/            # full-grid inference (target, sampler, readout, inference)
   utils/           # data I/O helpers
   tests/           # focused BGM-IV tests
 configs/           # YAML configs for experiments
@@ -211,30 +171,19 @@ Runtime files are intentionally ignored by Git:
 - `data/`
 - checkpoints and result folders
 
-Running `main.py` creates `logs/` and `dumps/` automatically. Each run
-gets a dump root named with the benchmark slug and run start time:
+`main.py` writes run directories under `dumps/`, including a configuration
+snapshot and result files for each benchmark setting. Headline MSE, coverage
+and interval length are stored in one `results.csv`; per-repeat JSON records
+contain sampler/target provenance and the finite-chain bias sensitivity.
+Runtime logs include the HMC acceptance rate and are stored under `logs/`.
 
-```text
-dumps/<dataset_slug>_<YYYY-MM-DD_HH-MM-SS-microseconds>/
-```
+MCMC calibration columns are `mcmc_cov50`, `mcmc_cov80`, `mcmc_cov95`,
+`mcmc_width50`, `mcmc_width80`, and `mcmc_width95`.
 
-For the provided configs, `<dataset_slug>` is one of
-`sim_demand_design_iv`, `sim_demand_design_mnist_iv`, or
-`sim_demand_design_vector_iv`. The dump root stores a config snapshot and one
-clean result file per benchmark setting:
-
-```text
-dumps/sim_demand_design_iv_2026-05-06_14-30-10-123456/
-  Sim_Demand_Design_IV.yaml
-  n_samples:<n>-rho:<rho>-v_dim:<v_dim>/
-    results.csv
-```
-
-The active markdown log is also recreated automatically:
-
-```text
-logs/outputs_dev_<dataset_slug>_active.md
-```
+The all-draw Gaussian-mixture readout is expected to add roughly 20--40 minutes
+per Pixel/Vector/MNIST-Feature repeat and 10--25 minutes per Demand repeat.
+These are planning estimates; cluster wall time and peak memory must be
+measured on the user's Yale jobs.
 
 ## Citation
 

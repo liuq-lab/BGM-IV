@@ -1,7 +1,7 @@
 dataset: Sim_Demand_Design_Vector_IV
 output_dir: "."
 save_res: False
-save_model: False
+save_model: True
 use_gpu: True
 binary_treatment: False
 use_bnn: False
@@ -24,7 +24,6 @@ h_units: [64,32,8]
 e_units: [64,64,64,64,64]
 dz_units: [64,32,8]
 kl_weight: 0.0001
-latent_pzv_weight: 0.5
 lr: 0.0002
 g_d_freq: 5
 use_z_rec: True
@@ -32,3 +31,19 @@ iv_mc_samples: 1000
 eval_mc_samples: 1000
 structural_map_steps: 1000
 structural_map_lr: 0.0001
+# --- vector recipe -----------------------------------------------------------
+# Covariate blocks are fixed to event-sum in code for training and inference.
+# outcome->particle coupling gamma, selected by the training-side held-out
+# criterion (held-out train-split instrument-moment MSE, seed-median argmin
+# over {0, 0.1, 0.25, 0.5, 1})
+outcome_to_particles_weight: 0.25
+# soft variance floor on the 1-d time head: sigma = 0.1 + learned_sd
+sigma_time_softfloor: 0.1
+# bit-level reproducibility contract (same GPU model); seeds run_seed
+deterministic_training: true
+# no test-grid metric is computed during training (grid-blind training)
+training_grid_monitor: false
+# --- structural evaluation --------------------------------------------------
+# map / encoder are point readouts; mcmc is the full-grid posterior integral.
+structural_methods: [map, encoder, mcmc]
+mcmc_family: vector
