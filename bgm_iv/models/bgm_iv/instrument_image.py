@@ -47,6 +47,7 @@ class BGM_IV_Image(BGM_IV):
             f_net=self.f_net,
             h_net=self.h_net,
             dz_net=self.dz_net,
+            egm_sigma2_x_ema=self.egm_sigma2_x_ema,
             g_pre_optimizer=self.g_pre_optimizer,
             d_pre_optimizer=self.d_pre_optimizer,
             g_optimizer=self.g_optimizer,

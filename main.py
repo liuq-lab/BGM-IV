@@ -4,6 +4,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import csv
 from datetime import datetime
 import gc
+import hashlib
 import io
 import multiprocessing
 import os
@@ -34,6 +35,16 @@ from bgm_iv.datasets import (
 import tensorflow as tf
 from bgm_iv.features import export_image_representations
 from bgm_iv.hashing import sha256_array, sha256_json, sha256_weights
+from bgm_iv.egm_multistart import (
+    EGM_SELECTOR_TEMPERATURE,
+    EGM_SELECTOR_VERSION,
+    derive_multistart_seeds,
+    make_candidate_manifest,
+    score_evaluation_iterations,
+    select_egm_candidate,
+    validate_multistart_config,
+    verify_manifest_hash,
+)
 
 
 def _load_mcmc():
@@ -340,6 +351,12 @@ def _apply_demand_design_benchmark_defaults(params):
                 )
             params[field_name] = expected
 
+    normalized = validate_multistart_config(
+        params, mcmc_only=bool(params.get("_mcmc_only_timestamp"))
+    )
+    params.clear()
+    params.update(normalized)
+
 
 def _demand_design_uses_rho(params):
     return bool(_get_demand_design_dataset_meta(params).get("uses_rho", True))
@@ -352,11 +369,17 @@ def _configure_tensorflow_threads(intra_op_threads=None, inter_op_threads=None):
         tf.config.threading.set_inter_op_parallelism_threads(int(inter_op_threads))
 
 
-def _configure_tensorflow_devices(use_gpu=False, gpu_slot=None, verbose=True):
+def _configure_tensorflow_devices(
+    use_gpu=False, gpu_slot=None, verbose=True, strict_memory_growth=False
+):
     gpus = tf.config.list_physical_devices("GPU")
 
     if use_gpu:
         if not gpus:
+            if strict_memory_growth:
+                raise RuntimeError(
+                    "TensorFlow GPU was required, but no GPU was detected"
+                )
             if verbose:
                 print(
                     "TensorFlow GPU requested but no GPU was detected. Falling back to CPU."
@@ -375,7 +398,10 @@ def _configure_tensorflow_devices(use_gpu=False, gpu_slot=None, verbose=True):
             try:
                 tf.config.experimental.set_memory_growth(gpu, True)
             except (RuntimeError, ValueError):
-                pass
+                if strict_memory_growth:
+                    raise
+            if strict_memory_growth and not tf.config.experimental.get_memory_growth(gpu):
+                raise RuntimeError("TensorFlow GPU memory growth was not enabled")
         if verbose:
             if gpu_slot is None:
                 print(f"TensorFlow GPU enabled with {len(selected_gpus)} device(s).")
@@ -481,6 +507,8 @@ def _render_demand_design_run_config(params):
         "sigma_y_softfloor",
         "deterministic_training",
         "training_grid_monitor",
+        "egm_num_warm_starts",
+        "egm_selection_top_k",
         "structural_methods",
         "mcmc_family",
         "holdout_seed_offset",
@@ -732,6 +760,15 @@ _FINAL_RESULT_COLUMNS = (
     "sigma_y_softfloor",
     "deterministic_training",
     "training_grid_monitor",
+    "egm_num_warm_starts",
+    "egm_selection_top_k",
+    "egm_selector_version",
+    "egm_selector_temperature",
+    "egm_selected_candidate_id",
+    "egm_selected_rank",
+    "egm_selected_probability",
+    "egm_candidate_scores_hash",
+    "egm_selection_manifest_hash",
     "device_name",
     "hostname",
     "feature_map",
@@ -817,6 +854,8 @@ def _build_final_results_row(params, history, final_results, provenance=None):
         "sigma_y_softfloor",
         "deterministic_training",
         "training_grid_monitor",
+        "egm_num_warm_starts",
+        "egm_selection_top_k",
         "feature_map",
         "pixel_checkpoint_timestamp",
     ):
@@ -824,6 +863,18 @@ def _build_final_results_row(params, history, final_results, provenance=None):
             row[key] = _blank(params.get(key))
     if "outcome_to_particles_weight" not in params and "resolved_gamma" in provenance:
         row["outcome_to_particles_weight"] = provenance["resolved_gamma"]
+    multistart = provenance.get("egm_multistart") or {}
+    for key in (
+        "egm_selector_version",
+        "egm_selector_temperature",
+        "egm_selected_candidate_id",
+        "egm_selected_rank",
+        "egm_selected_probability",
+        "egm_candidate_scores_hash",
+        "egm_selection_manifest_hash",
+    ):
+        if key in multistart:
+            row[key] = _blank(multistart.get(key))
     export = provenance.get("feature_export") or {}
     row["trunk_weights_sha256"] = _blank(export.get("trunk_weights_sha256"))
     row["phi_train_sha256"] = _blank((export.get("hashes") or {}).get("phi_train_sha256"))
@@ -1114,7 +1165,7 @@ def _fixed_standardizer(mean, scale):
     }
 
 
-def _standardize_demand_design_image_data(train, grid):
+def _standardize_demand_design_image_data(train, grid=None):
     stats = {
         "x": _fixed_standardizer(17.779, 3.7),
         "y": _fixed_standardizer(-292.1, 158.0),
@@ -1126,11 +1177,13 @@ def _standardize_demand_design_image_data(train, grid):
         "w": train["w"].astype(np.float32),
         "y_struct": train["y_struct"].astype(np.float32),
     }
-    grid_std = {
-        "x": _transform(grid["x"], stats["x"]),
-        "v": grid["v"].astype(np.float32),
-        "y_struct": grid["y_struct"].astype(np.float32),
-    }
+    grid_std = None
+    if grid is not None:
+        grid_std = {
+            "x": _transform(grid["x"], stats["x"]),
+            "v": grid["v"].astype(np.float32),
+            "y_struct": grid["y_struct"].astype(np.float32),
+        }
     return train_std, grid_std, stats
 
 
@@ -1307,7 +1360,483 @@ def _model_random_seed(params):
     return run_seed if bool(params.get("deterministic_training", False)) else None
 
 
+def _uses_egm_multistart(params):
+    return (
+        not params.get("_mcmc_only_timestamp")
+        and int(params.get("egm_num_warm_starts", 1)) > 1
+    )
+
+
+def _validate_egm_multistart_run_shape(params):
+    """Require one concrete outer cell per multistart coordinator process."""
+    if not _uses_egm_multistart(params):
+        return
+    if int(params.get("num_tasks", 1)) != 1:
+        raise ValueError("EGM multistart requires -t 1 (one GPU per outer cell)")
+    for field in ("n_samples", "rho"):
+        if isinstance(params.get(field), (list, tuple)):
+            raise ValueError(
+                f"EGM multistart requires scalar {field}; use --set {field}=..."
+            )
+    n_repeat = int(params.get("n_repeat", 1))
+    if n_repeat > 1 and params.get("_only_repeat_id") is None:
+        raise ValueError(
+            "EGM multistart requires one repeat; pass --repeat-id or set n_repeat=1"
+        )
+
+
+def _initialize_egm_candidate_worker(use_gpu):
+    """Configure one isolated EGM candidate process."""
+    _configure_tensorflow_threads(1, 1)
+    _configure_tensorflow_devices(
+        bool(use_gpu),
+        gpu_slot=0 if use_gpu else None,
+        strict_memory_growth=bool(use_gpu),
+    )
+    if use_gpu and not tf.config.list_logical_devices("GPU"):
+        raise RuntimeError("EGM multistart requested GPU but the worker sees no GPU")
+
+
+def _wait_for_egm_candidate_start_barrier(
+    barrier_dir, candidate_id, expected_workers, timeout_seconds=300
+):
+    """Synchronize candidate starts through auditable ready files."""
+    barrier_path = Path(barrier_dir)
+    barrier_path.mkdir(parents=True, exist_ok=True)
+    ready_path = barrier_path / f"candidate_{int(candidate_id):02d}.ready.json"
+    ready_payload = {
+        "candidate_id": int(candidate_id),
+        "worker_pid": os.getpid(),
+        "ready_at": datetime.utcnow().isoformat(timespec="microseconds") + "Z",
+    }
+    temporary_ready_path = ready_path.with_suffix(ready_path.suffix + ".tmp")
+    temporary_ready_path.write_text(
+        json.dumps(ready_payload, sort_keys=True, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(temporary_ready_path, ready_path)
+    deadline = time.monotonic() + float(timeout_seconds)
+    while True:
+        ready_files = list(barrier_path.glob("candidate_*.ready.json"))
+        if len(ready_files) == int(expected_workers):
+            payloads = [json.loads(path.read_text(encoding="utf-8")) for path in ready_files]
+            pids = {int(payload["worker_pid"]) for payload in payloads}
+            candidate_ids = {int(payload["candidate_id"]) for payload in payloads}
+            if len(pids) != int(expected_workers):
+                raise RuntimeError("EGM start barrier did not receive unique worker PIDs")
+            if candidate_ids != set(range(int(expected_workers))):
+                raise RuntimeError("EGM start barrier candidate IDs are incomplete")
+            return ready_payload
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                f"EGM start barrier timed out with {len(ready_files)}/"
+                f"{expected_workers} workers ready"
+            )
+        time.sleep(0.1)
+
+
+def _run_egm_candidate_worker(
+    candidate_id,
+    params,
+    train,
+    *,
+    init_seed,
+    schedule_seed,
+    evaluation_iterations,
+    candidate_root,
+    data_hash,
+    config_hash,
+    code_commit,
+    barrier_dir,
+    expected_workers,
+):
+    """Train and persist one pure-EGM candidate in a spawned process."""
+    candidate_root_path = Path(candidate_root)
+    candidate_root_path.mkdir(parents=True, exist_ok=True)
+    stdout_path = candidate_root_path / "candidate.stdout.log"
+    stderr_path = candidate_root_path / "candidate.stderr.log"
+    started_at = datetime.utcnow().isoformat(timespec="microseconds") + "Z"
+    try:
+        _wait_for_egm_candidate_start_barrier(
+            barrier_dir,
+            candidate_id,
+            expected_workers,
+        )
+        with stdout_path.open("w", encoding="utf-8", buffering=1) as stdout_handle, stderr_path.open(
+            "w", encoding="utf-8", buffering=1
+        ) as stderr_handle, contextlib.redirect_stdout(stdout_handle), contextlib.redirect_stderr(stderr_handle):
+            candidate_params = dict(params)
+            candidate_params["output_dir"] = str(candidate_root)
+            candidate_params["save_model"] = True
+            candidate_params["save_res"] = False
+            model_cls = _model_class_for_dataset(candidate_params["dataset"])
+            model = model_cls(
+                params=candidate_params,
+                timestamp=f"egm_candidate_{int(candidate_id):02d}",
+                random_seed=int(init_seed),
+            )
+            # Initialization is already materialized.  Reset every subsequent
+            # stochastic training stream to the common schedule seed so only
+            # network initialization differs between candidates.
+            tf.keras.utils.set_random_seed(int(schedule_seed))
+            np.random.seed(int(schedule_seed))
+            score_history = model.egm_init(
+                data=(train["x"], train["y"], train["v"], train["w"]),
+                egm_n_iter=int(candidate_params.get("fit_egm_n_iter", 10000)),
+                batch_size=int(candidate_params.get("fit_batch_size", 32)),
+                egm_batches_per_eval=int(
+                    candidate_params.get("fit_egm_batches_per_eval", 500)
+                ),
+                verbose=1,
+                evaluation_callback=None,
+                score_iterations=evaluation_iterations,
+            )
+            checkpoint_path = model.ckpt_manager.save(checkpoint_number=0)
+            checkpoint_hash = _checkpoint_files_hash(checkpoint_path)
+            checkpoint_weight_hash = sha256_json(
+                "egm-candidate-network-weights", _model_weight_hashes(model)
+            )
+            scores = [record["full_train_l2_loss_y"] for record in score_history]
+            finite = len(scores) == len(evaluation_iterations) and all(
+                np.isfinite(float(value)) for value in scores
+            )
+            status = "completed" if finite else "nonfinite_score"
+            finished_at = datetime.utcnow().isoformat(timespec="microseconds") + "Z"
+            logical_gpus = [
+                device.name for device in tf.config.list_logical_devices("GPU")
+            ]
+            physical_devices = [
+                f"{device.device_type}:{device.name}"
+                for device in tf.config.list_physical_devices()
+            ]
+            device_names = logical_gpus or ["cpu"]
+            device_hash = sha256_json(
+                "egm-candidate-device",
+                {
+                    "tensorflow_version": tf.__version__,
+                    "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+                    "physical_devices": physical_devices,
+                    "logical_training_devices": device_names,
+                },
+            )
+            manifest = make_candidate_manifest(
+                candidate_id=int(candidate_id),
+                init_seed=int(init_seed),
+                schedule_seed=int(schedule_seed),
+                evaluation_iterations=evaluation_iterations,
+                full_train_l2_loss_y=scores,
+                status=status,
+                failure_reason=None if finite else "non-finite full-training EGM score",
+                data_hash=data_hash,
+                config_hash=config_hash,
+                code_commit=code_commit,
+                checkpoint_path=str(checkpoint_path),
+                checkpoint_hash=checkpoint_hash,
+                checkpoint_weight_hash=checkpoint_weight_hash,
+                started_at=started_at,
+                finished_at=finished_at,
+                worker_pid=os.getpid(),
+                device_names=device_names,
+                device_hash=device_hash,
+            )
+            manifest_path = candidate_root_path / "candidate_manifest.json"
+            manifest_path.parent.mkdir(parents=True, exist_ok=True)
+            manifest_path.write_text(
+                json.dumps(manifest, indent=2, sort_keys=True, allow_nan=False) + "\n",
+                encoding="utf-8",
+            )
+            training_history = json.loads(
+                json.dumps(model.training_history, sort_keys=True, default=str)
+            )
+        return {
+            "candidate_id": int(candidate_id),
+            "manifest": manifest,
+            "manifest_path": str(manifest_path),
+            "training_history": training_history,
+            "stdout_path": str(stdout_path),
+            "stderr_path": str(stderr_path),
+            "error": None,
+        }
+    except Exception as exc:
+        with stderr_path.open("a", encoding="utf-8") as stderr_handle:
+            traceback.print_exc(file=stderr_handle)
+        return {
+            "candidate_id": int(candidate_id),
+            "manifest": None,
+            "manifest_path": None,
+            "training_history": [],
+            "stdout_path": str(stdout_path),
+            "stderr_path": str(stderr_path),
+            "error": {"type": type(exc).__name__, "message": str(exc)},
+        }
+    finally:
+        try:
+            tf.keras.backend.clear_session()
+        except Exception:
+            pass
+        gc.collect()
+
+
+def _fit_demand_design_model_multistart(params, train):
+    """Run all EGM starts concurrently, select one, then run exactly one BGM."""
+    normalized = validate_multistart_config(params)
+    observed_train = {
+        key: np.asarray(train[key], np.float32)
+        for key in ("x", "y", "v", "w")
+    }
+    num_starts = int(normalized["egm_num_warm_starts"])
+    top_k = int(normalized["egm_selection_top_k"])
+    if num_starts <= 1:
+        raise ValueError("multistart runner requires egm_num_warm_starts > 1")
+    if int(normalized.get("num_tasks", 1)) != 1:
+        raise ValueError("EGM multistart requires outer num_tasks=1 per GPU")
+
+    dataset = str(normalized["dataset"])
+    n_samples = int(normalized.get("n_samples", len(train["x"])))
+    rho = float(normalized.get("rho", 0.5))
+    repeat_id = int(normalized.get("repeat_id", 0))
+    seeds = derive_multistart_seeds(
+        dataset, n_samples, rho, repeat_id, num_starts
+    )
+    evaluation_iterations = score_evaluation_iterations(
+        int(normalized.get("fit_egm_n_iter", 10000)),
+        int(normalized.get("fit_egm_batches_per_eval", 500)),
+    )
+    data_hashes = _training_data_hashes(observed_train)
+    data_hash = sha256_json("egm-multistart-training-data", data_hashes)
+    config_hash = sha256_json(
+        "egm-multistart-training-config", _manifest_params(normalized)
+    )
+    code_commit = _code_commit() or "uncommitted"
+    bundle_id = (
+        f"n={n_samples}_rho={format(rho, '.17g')}_repeat={repeat_id}_"
+        f"{datetime.utcnow().strftime('%Y%m%dT%H%M%S%f')}"
+    )
+    bundle_root = (
+        Path(str(normalized.get("output_dir", ".")))
+        / "egm_multistart"
+        / bundle_id
+    )
+    bundle_root.mkdir(parents=True, exist_ok=False)
+    barrier_dir = bundle_root / "start_barrier"
+
+    print(
+        f"Launching {num_starts} EGM warm starts concurrently on one device "
+        f"(top_k={top_k}, selector={EGM_SELECTOR_VERSION})."
+    )
+    spawn_context = multiprocessing.get_context("spawn")
+    results = []
+    with ProcessPoolExecutor(
+        max_workers=num_starts,
+        mp_context=spawn_context,
+        initializer=_initialize_egm_candidate_worker,
+        initargs=(bool(normalized.get("use_gpu", False)),),
+    ) as executor:
+        futures = []
+        for candidate_id, init_seed in enumerate(seeds["init_seeds"]):
+            candidate_root = bundle_root / f"candidate_{candidate_id:02d}"
+            futures.append(
+                executor.submit(
+                    _run_egm_candidate_worker,
+                    candidate_id,
+                    normalized,
+                    observed_train,
+                    init_seed=int(init_seed),
+                    schedule_seed=int(seeds["schedule_seed"]),
+                    evaluation_iterations=evaluation_iterations,
+                    candidate_root=str(candidate_root),
+                    data_hash=data_hash,
+                    config_hash=config_hash,
+                    code_commit=code_commit,
+                    barrier_dir=str(barrier_dir),
+                    expected_workers=num_starts,
+                )
+            )
+        for future in as_completed(futures):
+            results.append(future.result())
+
+    results.sort(key=lambda item: item["candidate_id"])
+    if [item["candidate_id"] for item in results] != list(range(num_starts)):
+        raise RuntimeError("EGM candidate result IDs are incomplete or duplicated")
+    for result in results:
+        candidate_id = int(result["candidate_id"])
+        if result.get("error"):
+            error = result["error"]
+            raise RuntimeError(
+                f"EGM candidate {candidate_id} failed with "
+                f"{error['type']}: {error['message']}"
+            )
+        print(
+            f"EGM candidate {candidate_id} completed; "
+            f"log={result['stdout_path']}"
+        )
+        if not verify_manifest_hash(
+            result["manifest"],
+            hash_field="candidate_manifest_hash",
+            namespace="egm-candidate-manifest",
+        ):
+            raise RuntimeError(
+                f"EGM candidate {candidate_id} manifest hash mismatch"
+            )
+        manifest = result["manifest"]
+        expected_fields = {
+            "candidate_id": candidate_id,
+            "init_seed": int(seeds["init_seeds"][candidate_id]),
+            "schedule_seed": int(seeds["schedule_seed"]),
+            "evaluation_iterations": list(evaluation_iterations),
+            "data_hash": data_hash,
+            "config_hash": config_hash,
+            "code_commit": code_commit,
+        }
+        mismatches = [
+            key for key, value in expected_fields.items()
+            if manifest.get(key) != value
+        ]
+        if mismatches:
+            raise RuntimeError(
+                f"EGM candidate {candidate_id} identity mismatch: {mismatches}"
+            )
+        if manifest.get("status") not in {"completed", "nonfinite_score"}:
+            raise RuntimeError(f"EGM candidate {candidate_id} has invalid status")
+        if bool(normalized.get("use_gpu", False)) and not any(
+            "GPU" in str(name).upper() for name in manifest.get("device_names", [])
+        ):
+            raise RuntimeError(f"EGM candidate {candidate_id} did not run on GPU")
+        checkpoint_path = manifest.get("checkpoint_path")
+        if not checkpoint_path or not Path(str(checkpoint_path) + ".index").is_file():
+            raise RuntimeError(
+                f"EGM candidate {candidate_id} checkpoint is missing"
+            )
+        if _checkpoint_files_hash(checkpoint_path) != manifest.get("checkpoint_hash"):
+            raise RuntimeError(
+                f"EGM candidate {candidate_id} checkpoint file hash mismatch"
+            )
+        if not manifest.get("checkpoint_weight_hash"):
+            raise RuntimeError(
+                f"EGM candidate {candidate_id} checkpoint weight hash is missing"
+            )
+        if not manifest.get("device_hash"):
+            raise RuntimeError(f"EGM candidate {candidate_id} device hash is missing")
+        if manifest.get("data_hash") != data_hash:
+            raise RuntimeError("EGM candidates do not share one training-data hash")
+
+    if len({result["manifest"]["device_hash"] for result in results}) != 1:
+        raise RuntimeError("EGM candidates do not share one device identity hash")
+
+    candidate_scores = {
+        result["candidate_id"]: result["manifest"].get("tail_mean_score")
+        for result in results
+    }
+    selection = select_egm_candidate(
+        candidate_scores,
+        top_k=top_k,
+        selector_seed=int(seeds["selector_seed"]),
+    )
+    selection_path = bundle_root / "selection_manifest.json"
+    selection_path.write_text(
+        json.dumps(selection, indent=2, sort_keys=True, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
+    selected_id = int(selection["selected_candidate_id"])
+    selected = next(item for item in results if item["candidate_id"] == selected_id)
+    selected_checkpoint = str(selected["manifest"]["checkpoint_path"])
+    if _checkpoint_files_hash(selected_checkpoint) != selected["manifest"]["checkpoint_hash"]:
+        raise RuntimeError("selected EGM checkpoint file hash mismatch")
+
+    # Candidate workers have exited and released their contexts. Configure the
+    # parent only now, then restore the selected EGM state into the one model
+    # that will continue through BGM.
+    _configure_tensorflow_devices(
+        bool(normalized.get("use_gpu", False)),
+        strict_memory_growth=bool(normalized.get("use_gpu", False)),
+    )
+    if bool(normalized.get("use_gpu", False)) and not tf.config.list_logical_devices("GPU"):
+        raise RuntimeError("EGM multistart requested GPU but the BGM parent sees no GPU")
+    tf.keras.utils.set_random_seed(int(seeds["post_egm_seed"]))
+    np.random.seed(int(seeds["post_egm_seed"]))
+    model_cls = _model_class_for_dataset(dataset)
+    model = model_cls(params=normalized, random_seed=int(seeds["post_egm_seed"]))
+    restore_status = model.ckpt.restore(selected_checkpoint)
+    restore_status.assert_existing_objects_matched()
+    restored_weight_hash = sha256_json(
+        "egm-candidate-network-weights", _model_weight_hashes(model)
+    )
+    if restored_weight_hash != selected["manifest"]["checkpoint_weight_hash"]:
+        raise RuntimeError("selected EGM checkpoint weight identity mismatch")
+    # Model construction materializes fresh variables and Gaussian_sampler
+    # historically resets NumPy. Restore is complete now; restart the shared
+    # post-EGM streams immediately before the one BGM continuation.
+    tf.keras.utils.set_random_seed(int(seeds["post_egm_seed"]))
+    np.random.seed(int(seeds["post_egm_seed"]))
+    model.training_history = list(selected.get("training_history") or [])
+    model.egm_score_history = [
+        {
+            "iteration": int(iteration),
+            "full_train_l2_loss_y": float(score),
+        }
+        for iteration, score in zip(
+            selected["manifest"]["evaluation_iterations"],
+            selected["manifest"]["full_train_l2_loss_y"],
+        )
+    ]
+    model.fit_bgm_from_egm(
+        data=(
+            observed_train["x"],
+            observed_train["y"],
+            observed_train["v"],
+            observed_train["w"],
+        ),
+        epochs=int(normalized.get("fit_epochs", 100)),
+        epochs_per_eval=int(normalized.get("fit_epochs_per_eval", 10)),
+        batch_size=int(normalized.get("fit_batch_size", 32)),
+        verbose=1,
+        first_stage_warmup_epochs=int(
+            normalized.get("fit_first_stage_warmup_epochs", 30)
+        ),
+        evaluation_callback=None,
+        initialize_latents_from_encoder=True,
+        write_params=True,
+    )
+    model.egm_multistart_provenance = {
+        "egm_num_warm_starts": num_starts,
+        "egm_selection_top_k": top_k,
+        "egm_selector_version": EGM_SELECTOR_VERSION,
+        "egm_selector_temperature": EGM_SELECTOR_TEMPERATURE,
+        "egm_selected_candidate_id": selected_id,
+        "egm_selected_rank": int(selection["selected_rank"]),
+        "egm_selected_probability": float(selection["selected_probability"]),
+        "egm_candidate_scores_hash": sha256_json(
+            "egm-candidate-scores",
+            {"candidate_scores": selection["candidate_scores"]},
+        ),
+        "egm_selection_manifest_hash": selection["selection_manifest_hash"],
+        "egm_selection_manifest_path": str(selection_path),
+        "egm_candidate_manifest_hashes": [
+            result["manifest"]["candidate_manifest_hash"] for result in results
+        ],
+        "data_hash": data_hash,
+        "config_hash": config_hash,
+        "init_seeds": [int(value) for value in seeds["init_seeds"]],
+        "schedule_seed": int(seeds["schedule_seed"]),
+        "selector_seed": int(seeds["selector_seed"]),
+        "post_egm_seed": int(seeds["post_egm_seed"]),
+        "uses_validation": False,
+        "uses_holdout": False,
+        "uses_test_grid": False,
+    }
+    print(
+        "EGM multistart selected candidate "
+        f"{selected_id} at rank {selection['selected_rank']} "
+        f"with probability {selection['selected_probability']:.6f}."
+    )
+    return model
+
+
 def _fit_demand_design_model(params, train, evaluation_callback=None):
+    if _uses_egm_multistart(params):
+        if evaluation_callback is not None:
+            raise ValueError("EGM multistart selection cannot receive a grid callback")
+        return _fit_demand_design_model_multistart(params, train)
     model_cls = _model_class_for_dataset(params["dataset"])
     random_seed = _model_random_seed(params)
     model = model_cls(params=params, random_seed=random_seed)
@@ -1344,10 +1873,42 @@ def _restore_demand_design_model(params, timestamp, *, train=None, manifest_extr
         )
     if str(getattr(model, "timestamp", "")) != str(timestamp):
         raise RuntimeError("restored model timestamp differs from the requested one")
-    status = model.ckpt.restore(model.ckpt_manager.latest_checkpoint)
-    status.assert_existing_objects_matched()
+    latest_checkpoint = model.ckpt_manager.latest_checkpoint
+    checkpoint_variable_names = {
+        name for name, _ in tf.train.list_variables(latest_checkpoint)
+    }
+    has_egm_ema = any(
+        name.startswith("egm_sigma2_x_ema/")
+        for name in checkpoint_variable_names
+    )
+    if has_egm_ema:
+        status = model.ckpt.restore(latest_checkpoint)
+        status.assert_existing_objects_matched()
+    else:
+        # Checkpoints created before EGM multistart did not persist the EMA.
+        # Restore them through the exact legacy object graph rather than
+        # weakening the new schema with a broad ``expect_partial``.
+        legacy_ckpt = tf.train.Checkpoint(
+            g_net=model.g_net,
+            e_net=model.e_net,
+            f_net=model.f_net,
+            h_net=model.h_net,
+            dz_net=model.dz_net,
+            g_pre_optimizer=model.g_pre_optimizer,
+            d_pre_optimizer=model.d_pre_optimizer,
+            g_optimizer=model.g_optimizer,
+            f_optimizer=model.f_optimizer,
+            h_optimizer=model.h_optimizer,
+            posterior_optimizer=model.posterior_optimizer,
+        )
+        legacy_status = legacy_ckpt.restore(latest_checkpoint)
+        legacy_status.assert_existing_objects_matched()
+        print("Legacy checkpoint has no egm_sigma2_x_ema; strict legacy schema restored.")
     model.training_history = []
-    _verify_training_manifest(model, params, train, manifest_extra)
+    manifest = _verify_training_manifest(model, params, train, manifest_extra)
+    multistart = (manifest.get("notes") or {}).get("egm_multistart")
+    if multistart:
+        model.egm_multistart_provenance = multistart
     return model
 
 
@@ -1361,6 +1922,11 @@ def _fit_or_restore_demand_design_model(
             params, timestamp, train=train, manifest_extra=manifest_extra
         )
     model = _fit_demand_design_model(params, train, evaluation_callback=evaluation_callback)
+    multistart = getattr(model, "egm_multistart_provenance", None)
+    if multistart:
+        merged_notes = dict(manifest_notes or {})
+        merged_notes["egm_multistart"] = multistart
+        manifest_notes = merged_notes
     _write_training_manifest(model, params, train, manifest_extra, manifest_notes)
     return model
 
@@ -1397,6 +1963,15 @@ def _manifest_params(params):
         for key, value in params.items()
         if not str(key).startswith("_") and key not in _MANIFEST_EXCLUDED_KEYS
     }
+    # Preserve exact compatibility with manifests written before multistart:
+    # absent fields and the normalized legacy default 1/1 describe the same
+    # estimator and must hash identically.
+    if (
+        int(kept.get("egm_num_warm_starts", 1)) == 1
+        and int(kept.get("egm_selection_top_k", 1)) == 1
+    ):
+        kept.pop("egm_num_warm_starts", None)
+        kept.pop("egm_selection_top_k", None)
     return json.loads(json.dumps(kept, sort_keys=True, default=str))
 
 
@@ -1490,6 +2065,7 @@ def _verify_training_manifest(model, params, train=None, extra=None):
         "dataset": str(params["dataset"]),
         "checkpoint_timestamp": str(model.timestamp),
         "checkpoint_identity": _checkpoint_identity(model),
+        "weights": _model_weight_hashes(model),
         "params_hash": sha256_json("training-manifest-params", current_params),
     }
     if train is not None:
@@ -1530,6 +2106,28 @@ def _model_weight_hashes(model):
     }
 
 
+def _checkpoint_files_hash(checkpoint_prefix):
+    """Hash the immutable TensorFlow files belonging to one checkpoint prefix."""
+    prefix = Path(checkpoint_prefix)
+    paths = sorted(prefix.parent.glob(prefix.name + ".*"), key=lambda path: path.name)
+    if not paths:
+        raise FileNotFoundError(f"checkpoint files are missing for prefix {prefix}")
+    files = []
+    for path in paths:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        files.append(
+            {
+                "suffix": path.name[len(prefix.name) :],
+                "size": int(path.stat().st_size),
+                "sha256": digest.hexdigest(),
+            }
+        )
+    return sha256_json("tensorflow-checkpoint-files", {"files": files})
+
+
 def _checkpoint_identity(model):
     weights = _model_weight_hashes(model)
     return sha256_json(
@@ -1551,6 +2149,8 @@ _PROVENANCE_PARAM_KEYS = (
     "sigma_y_softfloor",
     "deterministic_training",
     "training_grid_monitor",
+    "egm_num_warm_starts",
+    "egm_selection_top_k",
     "structural_methods",
     "mcmc_family",
     "z_dims",
@@ -1582,6 +2182,11 @@ def _run_provenance(params, model, extra=None):
         "execution_environment": environment,
         "mcmc_only": bool(params.get("_mcmc_only_timestamp")),
     }
+    multistart = getattr(model, "egm_multistart_provenance", None)
+    if multistart:
+        provenance["egm_multistart"] = json.loads(
+            json.dumps(multistart, sort_keys=True, default=str)
+        )
     if extra:
         provenance.update(extra)
     return provenance
@@ -1992,34 +2597,61 @@ def _run_single_demand_design_vector_iv(params):
     train = simulate_demand_design_vector_iv(
         n_samples=n_samples, rho=rho, seed=run_seed, **simulate_kwargs
     )
-    grid = make_demand_design_vector_grid(
-        price_points=int(params.get("price_points", 20)),
-        time_points=int(params.get("time_points", 20)),
-        test_vector_seed=int(params.get("test_vector_seed", 42)),
-        **simulate_kwargs,
-    )
-    holdout_seed, holdout_n = _resolve_holdout_settings(params)
-    holdout = simulate_demand_design_vector_iv(
-        n_samples=holdout_n, rho=rho, seed=holdout_seed, **simulate_kwargs
-    )
     ranges_text = _render_observed_ranges(train)
     print(ranges_text)
 
     methods = _resolve_structural_methods(params)
     print("\nDFIV-style normalized-space experiment")
-    train_std, grid_std, stats = _standardize_demand_design_image_data(train, grid)
+    multistart = _uses_egm_multistart(params)
+    if multistart:
+        # The EGM bundle sees only the complete training sample.  Test-grid and
+        # additional holdout rows do not exist until selection and the single
+        # BGM continuation have both completed.
+        train_std, _, stats = _standardize_demand_design_image_data(train, None)
+        model = _fit_or_restore_demand_design_model(
+            params,
+            train_std,
+            evaluation_callback=None,
+        )
+        grid = make_demand_design_vector_grid(
+            price_points=int(params.get("price_points", 20)),
+            time_points=int(params.get("time_points", 20)),
+            test_vector_seed=int(params.get("test_vector_seed", 42)),
+            **simulate_kwargs,
+        )
+        _, grid_std, _ = _standardize_demand_design_image_data(train, grid)
+        holdout_seed, holdout_n = _resolve_holdout_settings(params)
+        holdout = simulate_demand_design_vector_iv(
+            n_samples=holdout_n, rho=rho, seed=holdout_seed, **simulate_kwargs
+        )
+    else:
+        grid = make_demand_design_vector_grid(
+            price_points=int(params.get("price_points", 20)),
+            time_points=int(params.get("time_points", 20)),
+            test_vector_seed=int(params.get("test_vector_seed", 42)),
+            **simulate_kwargs,
+        )
+        holdout_seed, holdout_n = _resolve_holdout_settings(params)
+        holdout = simulate_demand_design_vector_iv(
+            n_samples=holdout_n, rho=rho, seed=holdout_seed, **simulate_kwargs
+        )
+        train_std, grid_std, stats = _standardize_demand_design_image_data(train, grid)
+        model = _fit_or_restore_demand_design_model(
+            params,
+            train_std,
+            evaluation_callback=_maybe_structural_monitor_callback(
+                params,
+                grid_std["x"],
+                grid_std["v"],
+                grid["y_struct"],
+                y_stats=stats["y"],
+            ),
+        )
     holdout_model = {
         "v": holdout["v"].astype(np.float32),
         "w": holdout["w"].astype(np.float32),
         "y": holdout["y"],
     }
-    model = _fit_or_restore_demand_design_model(
-        params,
-        train_std,
-        evaluation_callback=_maybe_structural_monitor_callback(
-            params, grid_std["x"], grid_std["v"], grid["y_struct"], y_stats=stats["y"]
-        ),
-    )
     mcmc_context = None
     if "mcmc" in methods:
         mcmc_context = _mcmc_context(
@@ -2582,6 +3214,7 @@ def main():
         params["_mcmc_only_timestamp"] = str(args.mcmc_only)
     _apply_demand_design_benchmark_defaults(params)
     _validate_map_only_structural_config(params)
+    _validate_egm_multistart_run_shape(params)
 
     if _resolve_num_tasks(params) > 1 and not _supports_parallel_demand_design(params):
         raise ValueError(
@@ -2589,9 +3222,9 @@ def main():
             "datasets (Sim_Demand_Design_IV / _Mnist_IV / _Vector_IV / _Mnist_Feature_IV)."
         )
 
-    if _is_parallel_demand_design_run(params):
+    if _is_parallel_demand_design_run(params) or _uses_egm_multistart(params):
         print(
-            "TensorFlow device configuration deferred to demand-design parallel workers."
+            "TensorFlow device configuration deferred to spawned training workers."
         )
     else:
         _configure_tensorflow_devices(bool(params.get("use_gpu", False)))

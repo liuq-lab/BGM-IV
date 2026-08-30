@@ -129,3 +129,203 @@ def test_vector_covariate_posterior_is_untempered(tmp_path):
     actual = model.get_log_covariate_posterior(data_v, data_z)
 
     np.testing.assert_allclose(actual.numpy(), expected.numpy(), rtol=1e-6, atol=1e-6)
+
+
+def test_full_train_egm_score_matches_manual_gh_and_is_chunk_invariant(tmp_path):
+    model = BGM_IV_Vector(params=_make_vector_params(tmp_path), random_seed=13)
+    train = simulate_demand_design_vector_iv(
+        n_samples=11,
+        rho=0.5,
+        seed=7,
+        v_dim=785,
+        vector_dim=784,
+        feature_seed=42,
+        representation_sd=0.5,
+    )
+    data = (train["x"], train["y"], train["v"], train["w"])
+
+    full = model.evaluate_egm_full_train_l2_y(data, chunk_size=None)
+    chunked = model.evaluate_egm_full_train_l2_y(data, chunk_size=3)
+    data_z = model.e_net(train["v"], training=False)
+    data_z0, data_z1, data_z2 = model._split_z(data_z)
+    h_output = model.h_net(
+        tf.concat([data_z0, data_z2, train["w"]], axis=-1), training=False
+    )
+    mu_x = h_output[:, :1]
+    sigma2_x = tf.minimum(
+        model.egm_sigma2_x_ema * tf.ones_like(mu_x),
+        float(model.params["egm_outcome_sigma_cap"]) ** 2,
+    )
+    x_nodes = (
+        mu_x[None, :, :]
+        + np.sqrt(2.0)
+        * tf.sqrt(sigma2_x)[None, :, :]
+        * model._egm_gh_t
+    )
+    means = []
+    for node_index in range(int(model.params["egm_outcome_gh_nodes"])):
+        f_output = model.f_net(
+            tf.concat(
+                [data_z0, data_z1, x_nodes[node_index]], axis=-1
+            ),
+            training=False,
+        )[:, :1]
+        means.append(model._egm_gh_w[node_index] * f_output)
+    manual_mean = tf.add_n(means).numpy()
+    manual = float(
+        np.mean(
+            np.square(train["y"].astype(np.float64) - manual_mean.astype(np.float64))
+        )
+    )
+
+    assert full == pytest.approx(manual, rel=1e-6, abs=1e-8)
+    assert chunked == pytest.approx(full, rel=1e-6, abs=1e-8)
+
+
+def test_full_train_egm_score_does_not_mutate_model_or_ema(tmp_path):
+    global_generator = tf.random.Generator.from_seed(20260830)
+    tf.random.set_global_generator(global_generator)
+    model = BGM_IV_Vector(params=_make_vector_params(tmp_path), random_seed=13)
+    train = simulate_demand_design_vector_iv(
+        n_samples=8,
+        rho=0.5,
+        seed=7,
+        v_dim=785,
+        vector_dim=784,
+        feature_seed=42,
+        representation_sd=0.5,
+    )
+    data = (train["x"], train["y"], train["v"], train["w"])
+    model.egm_sigma2_x_ema.assign(0.123)
+    before_weights = [variable.numpy().copy() for variable in model.ckpt.g_net.variables]
+    before_weights += [variable.numpy().copy() for variable in model.ckpt.e_net.variables]
+    before_weights += [variable.numpy().copy() for variable in model.ckpt.f_net.variables]
+    before_weights += [variable.numpy().copy() for variable in model.ckpt.h_net.variables]
+    before_ema = float(model.egm_sigma2_x_ema.numpy())
+    before_iterations = {
+        name: int(optimizer.iterations.numpy())
+        for name, optimizer in (
+            ("g_pre", model.g_pre_optimizer),
+            ("d_pre", model.d_pre_optimizer),
+            ("g", model.g_optimizer),
+            ("f", model.f_optimizer),
+            ("h", model.h_optimizer),
+            ("posterior", model.posterior_optimizer),
+        )
+    }
+    numpy_state = np.random.get_state()
+    tf_state = global_generator.state.numpy().copy()
+
+    score = model.evaluate_egm_full_train_l2_y(data, chunk_size=3)
+
+    after_weights = [variable.numpy() for variable in model.ckpt.g_net.variables]
+    after_weights += [variable.numpy() for variable in model.ckpt.e_net.variables]
+    after_weights += [variable.numpy() for variable in model.ckpt.f_net.variables]
+    after_weights += [variable.numpy() for variable in model.ckpt.h_net.variables]
+    assert np.isfinite(score)
+    for before, after in zip(before_weights, after_weights):
+        np.testing.assert_array_equal(before, after)
+    assert float(model.egm_sigma2_x_ema.numpy()) == pytest.approx(before_ema)
+    after_iterations = {
+        name: int(optimizer.iterations.numpy())
+        for name, optimizer in (
+            ("g_pre", model.g_pre_optimizer),
+            ("d_pre", model.d_pre_optimizer),
+            ("g", model.g_optimizer),
+            ("f", model.f_optimizer),
+            ("h", model.h_optimizer),
+            ("posterior", model.posterior_optimizer),
+        )
+    }
+    assert after_iterations == before_iterations
+    after_numpy_state = np.random.get_state()
+    assert after_numpy_state[0] == numpy_state[0]
+    np.testing.assert_array_equal(after_numpy_state[1], numpy_state[1])
+    assert after_numpy_state[2:] == numpy_state[2:]
+    np.testing.assert_array_equal(global_generator.state.numpy(), tf_state)
+
+
+def test_vector_checkpoint_roundtrips_egm_sigma2_x_ema(tmp_path):
+    params = _make_vector_params(tmp_path)
+    params["save_model"] = True
+    model = BGM_IV_Vector(params=params, timestamp="ema_roundtrip", random_seed=13)
+    model.egm_sigma2_x_ema.assign(0.123)
+    checkpoint = model.ckpt_manager.save(checkpoint_number=0)
+
+    restored = BGM_IV_Vector(
+        params=params, timestamp="ema_roundtrip", random_seed=99
+    )
+    status = restored.ckpt.restore(checkpoint)
+    status.assert_existing_objects_matched()
+    assert float(restored.egm_sigma2_x_ema.numpy()) == pytest.approx(0.123)
+
+
+def test_egm_records_exact_requested_full_train_score_iterations(tmp_path):
+    model = BGM_IV_Vector(params=_make_vector_params(tmp_path), random_seed=13)
+    train = simulate_demand_design_vector_iv(
+        n_samples=8,
+        rho=0.5,
+        seed=7,
+        v_dim=785,
+        vector_dim=784,
+        feature_seed=42,
+        representation_sd=0.5,
+    )
+    data = (train["x"], train["y"], train["v"], train["w"])
+    requested = tuple(range(10))
+    scores = model.egm_init(
+        data,
+        egm_n_iter=9,
+        batch_size=4,
+        egm_batches_per_eval=1,
+        verbose=0,
+        score_iterations=requested,
+        score_chunk_size=3,
+    )
+    assert [record["iteration"] for record in scores] == list(requested)
+    assert all(np.isfinite(record["full_train_l2_loss_y"]) for record in scores)
+
+
+def test_restored_pure_egm_checkpoint_continues_one_bgm_epoch(tmp_path):
+    params = _make_vector_params(tmp_path)
+    params["save_model"] = True
+    train = simulate_demand_design_vector_iv(
+        n_samples=8,
+        rho=0.5,
+        seed=7,
+        v_dim=785,
+        vector_dim=784,
+        feature_seed=42,
+        representation_sd=0.5,
+    )
+    data = (train["x"], train["y"], train["v"], train["w"])
+    candidate = BGM_IV_Vector(
+        params=params, timestamp="phase_split", random_seed=13
+    )
+    candidate.egm_init(
+        data,
+        egm_n_iter=0,
+        batch_size=4,
+        egm_batches_per_eval=1,
+        verbose=0,
+        score_iterations=[0],
+    )
+    checkpoint = candidate.ckpt_manager.save(checkpoint_number=0)
+    post_egm_history = list(candidate.training_history)
+
+    restored = BGM_IV_Vector(
+        params=params, timestamp="phase_split_restored", random_seed=99
+    )
+    status = restored.ckpt.restore(checkpoint)
+    status.assert_existing_objects_matched()
+    restored.training_history = post_egm_history
+    history = restored.fit_bgm_from_egm(
+        data,
+        epochs=0,
+        epochs_per_eval=1,
+        batch_size=4,
+        verbose=0,
+    )
+    assert history[0]["stage"] == "post_egm"
+    assert history[-1]["stage"] == "epoch_eval"
+    assert history[-1]["epoch"] == 0

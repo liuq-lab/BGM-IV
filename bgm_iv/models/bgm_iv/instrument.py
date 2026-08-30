@@ -159,6 +159,7 @@ class BGM_IV(CausalBGM):
             f_net=self.f_net,
             h_net=self.h_net,
             dz_net=self.dz_net,
+            egm_sigma2_x_ema=self.egm_sigma2_x_ema,
             g_pre_optimizer=self.g_pre_optimizer,
             d_pre_optimizer=self.d_pre_optimizer,
             g_optimizer=self.g_optimizer,
@@ -556,7 +557,7 @@ class BGM_IV(CausalBGM):
             return 2.0
         return float(max(1, n_samples))
 
-    def _outcome_outputs_for_samples(self, data_z, x_samples):
+    def _outcome_outputs_for_samples(self, data_z, x_samples, training=True):
         """Evaluate ``f(z0, z1, x)`` for a stack of treatment samples.
 
         Parameters
@@ -565,6 +566,10 @@ class BGM_IV(CausalBGM):
             Latent variables with shape ``(n, sum(z_dims))``.
         x_samples : tf.Tensor
             Treatment samples with shape ``(n_samples, n, 1)``.
+        training : bool, default=True
+            Keras execution mode for the outcome network. EGM training keeps
+            the historical ``True`` default; deterministic scoring passes
+            ``False`` so dropout and other training-only behavior are disabled.
 
         Returns
         -------
@@ -587,8 +592,122 @@ class BGM_IV(CausalBGM):
             ],
             axis=-1,
         )
-        flat_outputs = self.f_net(flat_inputs)
+        flat_outputs = self.f_net(flat_inputs, training=training)
         return tf.reshape(flat_outputs, (n_samples, n_obs, 2))
+
+    def _egm_integrated_outcome_mean_deterministic(self, data_v, data_w):
+        """Evaluate the EGM outcome moment without sampling or state updates.
+
+        This is the inference-mode counterpart of the outcome block in
+        :meth:`train_gen_step_integral`. Continuous treatments use the same
+        fixed Gauss--Hermite nodes, weights, variance source, and variance cap
+        as EGM training; binary treatments use the same exact two-point
+        integral. No optimizer, EMA, model weight, or random-number state is
+        updated.
+        """
+        data_v = tf.convert_to_tensor(data_v, dtype=tf.float32)
+        data_w = tf.convert_to_tensor(data_w, dtype=tf.float32)
+        data_z = self.e_net(data_v, training=False)
+        data_z0, data_z1, data_z2 = self._split_z(data_z)
+        h_output = self.h_net(
+            tf.concat([data_z0, data_z2, data_w], axis=-1), training=False
+        )
+        data_x_mean = h_output[:, :1]
+
+        if self.params["binary_treatment"]:
+            prob_x = tf.sigmoid(data_x_mean)
+            f_out_one = self.f_net(
+                tf.concat(
+                    [data_z0, data_z1, tf.ones_like(data_x_mean)], axis=-1
+                ),
+                training=False,
+            )
+            f_out_zero = self.f_net(
+                tf.concat(
+                    [data_z0, data_z1, tf.zeros_like(data_x_mean)], axis=-1
+                ),
+                training=False,
+            )
+            return (
+                prob_x * f_out_one[:, :1]
+                + (1.0 - prob_x) * f_out_zero[:, :1]
+            )
+
+        sigma_mode = self.params["egm_outcome_sigma"]
+        if sigma_mode == "head":
+            sigma_square_x = self._continuous_sigma(
+                h_output, sigma_key="sigma_x"
+            )
+        elif sigma_mode == "residual_ema":
+            # Read the trained EMA, but deliberately do not update it while
+            # scoring candidates.
+            sigma_square_x = self.egm_sigma2_x_ema * tf.ones_like(data_x_mean)
+        else:
+            sigma_square_x = float(sigma_mode) ** 2 * tf.ones_like(data_x_mean)
+        cap = float(self.params["egm_outcome_sigma_cap"])
+        sigma_square_x = tf.minimum(sigma_square_x, cap ** 2)
+        x_nodes = (
+            data_x_mean[None, :, :]
+            + 1.4142135623730951
+            * tf.sqrt(sigma_square_x)[None, :, :]
+            * self._egm_gh_t
+        )
+        f_outputs = self._outcome_outputs_for_samples(
+            data_z, x_nodes, training=False
+        )
+        return tf.reduce_sum(self._egm_gh_w * f_outputs[:, :, :1], axis=0)
+
+    def evaluate_egm_full_train_l2_y(self, data, chunk_size=1024):
+        """Return deterministic full-training EGM ``l2_loss_y``.
+
+        The score uses every row of the supplied training tuple and the exact
+        EGM integral, rather than a random terminal minibatch or the stochastic
+        Monte Carlo path in :meth:`evaluate`. Chunking only bounds accelerator
+        memory; squared errors are concatenated in original row order and
+        reduced once in float64 on the host.
+
+        Parameters
+        ----------
+        data : tuple of np.ndarray
+            Training tuple ``(x, y, v, w)``. ``x`` is validated for schema
+            consistency but is not used by the integrated outcome moment.
+        chunk_size : int or None, default=1024
+            Number of rows evaluated per inference-mode forward pass. ``None``
+            evaluates all rows in one pass.
+
+        Returns
+        -------
+        float
+            Mean squared outcome error over all training rows.
+        """
+        if bool(self.params.get("use_bnn", False)):
+            raise ValueError(
+                "Deterministic EGM scoring requires use_bnn=False because "
+                "DenseFlipout advances random state even in inference mode."
+            )
+        _, data_y, data_v, data_w = self._parse_train_data(data)
+        n_obs = len(data_y)
+        if n_obs == 0:
+            raise ValueError("Cannot score EGM on an empty training set.")
+        if chunk_size is None:
+            chunk_size = n_obs
+        chunk_size = int(chunk_size)
+        if chunk_size <= 0:
+            raise ValueError("chunk_size must be a positive integer or None.")
+
+        squared_errors = []
+        for start in range(0, n_obs, chunk_size):
+            stop = min(start + chunk_size, n_obs)
+            mean_y = self._egm_integrated_outcome_mean_deterministic(
+                data_v[start:stop], data_w[start:stop]
+            )
+            chunk_error = tf.square(
+                tf.convert_to_tensor(data_y[start:stop], dtype=tf.float32)
+                - mean_y
+            )
+            squared_errors.append(np.asarray(chunk_error.numpy()).reshape(-1))
+        ordered_errors = np.concatenate(squared_errors).astype(np.float64, copy=False)
+        return float(np.mean(ordered_errors, dtype=np.float64))
 
     def _integrated_outcome_log_prob(self, data_z, data_w, data_y, n_samples=None, eps=1e-6):
         """Monte Carlo IV log-likelihood ``log p(y | w, z)``.
@@ -1049,9 +1168,49 @@ class BGM_IV(CausalBGM):
         egm_batches_per_eval=500,
         verbose=1,
         evaluation_callback=None,
+        score_iterations=None,
+        score_chunk_size=1024,
     ):
-        """Run IV-aware EGM initialization on ``(x, y, v, w)`` data."""
+        """Run IV-aware EGM initialization on ``(x, y, v, w)`` data.
+
+        Parameters
+        ----------
+        score_iterations : iterable of int or None, optional
+            EGM iteration labels at which to record deterministic full-training
+            ``l2_loss_y``. Scoring happens after that iteration's update and is
+            independent of the random minibatch printed in the regular EGM log.
+        score_chunk_size : int or None, default=1024
+            Chunk size forwarded to
+            :meth:`evaluate_egm_full_train_l2_y`.
+
+        Returns
+        -------
+        list of dict
+            Ordered records with keys ``iteration`` and
+            ``full_train_l2_loss_y``. The same list is stored in
+            ``self.egm_score_history``.
+        """
         data_x, data_y, data_v, data_w = self._parse_train_data(data)
+        score_data = (data_x, data_y, data_v, data_w)
+        if score_iterations is None:
+            score_iteration_set = set()
+        else:
+            raw_score_iterations = list(score_iterations)
+            score_iteration_set = set()
+            for iteration in raw_score_iterations:
+                if isinstance(iteration, bool) or int(iteration) != iteration:
+                    raise ValueError("score_iterations must contain integers.")
+                iteration = int(iteration)
+                if iteration < 0 or iteration > int(egm_n_iter):
+                    raise ValueError(
+                        "score_iterations must lie between 0 and egm_n_iter."
+                    )
+                score_iteration_set.add(iteration)
+            if len(score_iteration_set) != len(raw_score_iterations):
+                raise ValueError("score_iterations must not contain duplicates.")
+        self.egm_score_history = []
+        if not hasattr(self, "training_history"):
+            self.training_history = []
 
         print("EGM Initialization Starts ...")
         use_integral = str(self.params.get("egm_outcome_loss", "plugin")) == "integral"
@@ -1082,6 +1241,20 @@ class BGM_IV(CausalBGM):
             e_loss_adv, l2_loss_v, l2_loss_z, l2_loss_x, l2_loss_y, g_e_loss = (
                 egm_gen_step(batch_z, batch_v, batch_w, batch_x, batch_y)
             )
+            if batch_iter in score_iteration_set:
+                full_train_l2_loss_y = self.evaluate_egm_full_train_l2_y(
+                    score_data, chunk_size=score_chunk_size
+                )
+                score_record = {
+                    "iteration": int(batch_iter),
+                    "full_train_l2_loss_y": float(full_train_l2_loss_y),
+                }
+                self.egm_score_history.append(score_record)
+                if verbose:
+                    print(
+                        "EGM Full-Training Score Iter [%d] : l2_loss_y [%.8f]"
+                        % (batch_iter, full_train_l2_loss_y)
+                    )
             if batch_iter % egm_batches_per_eval == 0:
                 loss_contents = (
                     "EGM Initialization Iter [%d] : e_loss_adv [%.4f], l2_loss_v [%.4f], "
@@ -1123,6 +1296,7 @@ class BGM_IV(CausalBGM):
         if verbose:
             print("Post-EGM encoder metrics:", self._format_training_record(record))
         print("EGM Initialization Ends.")
+        return list(self.egm_score_history)
 
     def _apply_bn_determinism(self):
         """Force non-fused BatchNormalization under the determinism contract.
@@ -1189,16 +1363,14 @@ class BGM_IV(CausalBGM):
             switching on the IV outcome pseudo-likelihood.
         """
         self._apply_bn_determinism()
-        data_x, data_y, data_v, data_w = self._parse_train_data(data)
-        if first_stage_warmup_epochs is None:
-            first_stage_warmup_epochs = int(self.params["first_stage_warmup_epochs"])
+        self._parse_train_data(data)
 
         if self.params["save_res"]:
             with open("{}/params.txt".format(self.save_dir), "w") as f_params:
                 f_params.write(str(self.params))
 
+        self.training_history = []
         if use_egm_init:
-            self.training_history = []
             self.egm_init(
                 data,
                 egm_n_iter=egm_n_iter,
@@ -1207,10 +1379,62 @@ class BGM_IV(CausalBGM):
                 verbose=verbose,
                 evaluation_callback=evaluation_callback,
             )
+        return self.fit_bgm_from_egm(
+            data,
+            epochs=epochs,
+            epochs_per_eval=epochs_per_eval,
+            batch_size=batch_size,
+            startoff=startoff,
+            save_format=save_format,
+            verbose=verbose,
+            first_stage_warmup_epochs=first_stage_warmup_epochs,
+            evaluation_callback=evaluation_callback,
+            initialize_latents_from_encoder=use_egm_init,
+            write_params=False,
+        )
+
+    def fit_bgm_from_egm(
+        self,
+        data,
+        epochs=100,
+        epochs_per_eval=5,
+        batch_size=32,
+        startoff=0,
+        save_format="txt",
+        verbose=1,
+        first_stage_warmup_epochs=None,
+        evaluation_callback=None,
+        initialize_latents_from_encoder=True,
+        write_params=True,
+    ):
+        """Run the post-EGM BGM stage on ``(x, y, v, w)`` data.
+
+        This reusable stage assumes the model networks already contain the EGM
+        state to continue from, either because :meth:`egm_init` just completed
+        or because an EGM-only checkpoint was restored. It initializes the
+        subject particles from ``e(v)`` by default, registers them in the
+        checkpoint, and then executes the historical BGM epoch loop unchanged.
+
+        Set ``initialize_latents_from_encoder=False`` only for the legacy
+        ``fit(..., use_egm_init=False)`` random-particle path. Existing
+        ``training_history`` entries are retained so the single-start wrapper
+        still returns the post-EGM row followed by epoch rows.
+        """
+        self._apply_bn_determinism()
+        data_x, data_y, data_v, data_w = self._parse_train_data(data)
+        if first_stage_warmup_epochs is None:
+            first_stage_warmup_epochs = int(self.params["first_stage_warmup_epochs"])
+        if not hasattr(self, "training_history"):
+            self.training_history = []
+
+        if write_params and self.params["save_res"]:
+            with open("{}/params.txt".format(self.save_dir), "w") as f_params:
+                f_params.write(str(self.params))
+
+        if initialize_latents_from_encoder:
             print("Initialize latent variables Z with e(V)...")
             data_z_init = self.e_net(data_v)
         else:
-            self.training_history = []
             print("Random initialization of latent variables Z...")
             data_z_init = np.random.normal(
                 0,

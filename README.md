@@ -105,29 +105,49 @@ python main.py -c configs/Sim_Demand_Design_IV.yaml -t 1
 ```
 
 A configuration may define a Cartesian-product sweep. The vector configuration
-contains 3 sample sizes, 5 values of `rho`, and 20 repeats. Scalar `--set`
-overrides collapse only the named axes; unspecified axes remain active. Using
-`configs/Sim_Demand_Design_Vector_IV.yaml`, the common cases are:
+contains 3 sample sizes, 5 values of `rho`, and 20 repeats. Its canonical
+multistart recipe requires one concrete outer cell per process so that the
+winner BGM/MCMC CUDA context exits before another ten-candidate bundle starts.
+Use scalar `n_samples`, scalar `rho`, one `--repeat-id`, and `-t 1`:
 
 | Additional arguments | Concrete runs |
 | --- | ---: |
-| `-t 1` | 300, sequentially |
-| `--set n_samples=5000 -t 2` | 100; all 5 values of `rho` and 20 repeats, at most 2 concurrently |
-| `--set n_samples=5000 --set rho=0.5 -t 1` | 20 repeats, sequentially |
-| `--set n_samples=5000 --repeat-id 0 -t 1` | 5; repeat 0 at every value of `rho` |
 | `--set n_samples=5000 --set rho=0.5 --repeat-id 0 -t 1` | 1 |
 
-For example, the second case is:
+For example:
 
 ```bash
 python main.py -c configs/Sim_Demand_Design_Vector_IV.yaml \
-  --set n_samples=5000 -t 2
+  --set n_samples=5000 --set rho=0.5 --repeat-id 0 -t 1
 ```
 
-`-t N` changes only the maximum concurrency, not the number of runs. When
-`use_gpu: true`, each worker requires a distinct visible GPU. `--repeat-id`
-accepts one integer in `0, ..., n_repeat - 1`, requires `-t 1`, and applies to
-every sweep-axis combination that remains active.
+For a legacy single-start Cartesian sweep, override both multistart fields to
+`1`; then `-t N` changes only outer-run concurrency and each worker still
+requires a distinct visible GPU. `--repeat-id` accepts one integer in
+`0, ..., n_repeat - 1` and requires `-t 1`.
+
+### EGM multistart initialization
+
+The Vector benchmark enables a training-only EGM multistart procedure with:
+
+```yaml
+egm_num_warm_starts: 10
+egm_selection_top_k: 3
+```
+
+All starts use the same complete training sample and optimization schedule but
+different, content-derived initialization seeds.  During the final ten EGM
+evaluation points, each start is scored by the same `l2_loss_y` term evaluated
+deterministically over every training row with the model's fixed eight-node
+Gauss--Hermite treatment integral.  No validation split, simulated holdout,
+evaluation grid, or structural truth is available to the selector.
+
+The three lowest-scoring starts receive probabilities from a fixed
+relative-loss softmax with temperature `0.05`; a manifest-derived random draw
+selects exactly one terminal EGM checkpoint.  Only that checkpoint continues
+through BGM, MAP, encoder, and MCMC evaluation.  Omitting the fields defaults
+to the legacy single-start path (`1` start and top `1`).  The extra EGM starts
+are part of the estimator's compute budget and are not independent repeats.
 
 To restore a saved training checkpoint and run only structural evaluation and
 MCMC inference:
