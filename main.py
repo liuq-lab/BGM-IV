@@ -398,8 +398,19 @@ def _configure_tensorflow_devices(
                     f"Requested GPU slot {gpu_slot} but only {len(gpus)} visible GPU(s) exist."
                 )
             selected_gpus = [gpus[gpu_slot]]
-            tf.config.set_visible_devices(selected_gpus, "GPU")
+            if list(tf.config.get_visible_devices("GPU")) != selected_gpus:
+                tf.config.set_visible_devices(selected_gpus, "GPU")
         for gpu in selected_gpus:
+            try:
+                memory_growth_enabled = bool(
+                    tf.config.experimental.get_memory_growth(gpu)
+                )
+            except (RuntimeError, ValueError):
+                if strict_memory_growth:
+                    raise
+                memory_growth_enabled = False
+            if memory_growth_enabled:
+                continue
             try:
                 tf.config.experimental.set_memory_growth(gpu, True)
             except (RuntimeError, ValueError):
@@ -414,7 +425,8 @@ def _configure_tensorflow_devices(
                 print(f"TensorFlow GPU enabled for worker slot {gpu_slot}.")
         return
 
-    tf.config.set_visible_devices([], "GPU")
+    if tf.config.get_visible_devices("GPU"):
+        tf.config.set_visible_devices([], "GPU")
     if verbose:
         print("TensorFlow GPU disabled. Using CPU only.")
 
@@ -3355,7 +3367,21 @@ def main():
             "datasets (Sim_Demand_Design_IV / _Mnist_IV / _Vector_IV / _Mnist_Feature_IV)."
         )
 
-    if _is_parallel_demand_design_run(params) or _uses_egm_multistart(params):
+    if _uses_egm_multistart(params):
+        # The parent prepares data before spawning the EGM candidates.  Pixel
+        # data loading enters TensorFlow's eager context, after which physical
+        # device options can no longer be changed.  Bind memory growth first;
+        # the idempotent handoff call after candidate selection then only
+        # verifies this configuration before restoring the winning state.
+        _configure_tensorflow_devices(
+            bool(params.get("use_gpu", False)),
+            strict_memory_growth=bool(params.get("use_gpu", False)),
+        )
+        print(
+            "TensorFlow parent device configuration initialized before data "
+            "loading; candidate training remains deferred to spawned workers."
+        )
+    elif _is_parallel_demand_design_run(params):
         print(
             "TensorFlow device configuration deferred to spawned training workers."
         )

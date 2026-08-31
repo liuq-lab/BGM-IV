@@ -1187,14 +1187,20 @@ def test_render_demand_design_active_window_omits_updated_at_and_run_id(tmp_path
 class _DummyExperimentalConfig:
     def __init__(self):
         self.memory_growth_calls = []
+        self.memory_growth = {}
 
     def set_memory_growth(self, gpu, enabled):
         self.memory_growth_calls.append((gpu, enabled))
+        self.memory_growth[gpu] = bool(enabled)
+
+    def get_memory_growth(self, gpu):
+        return self.memory_growth.get(gpu, False)
 
 
 class _DummyTfConfig:
     def __init__(self, gpus):
         self.gpus = list(gpus)
+        self.visible_gpus = list(gpus)
         self.visible_device_calls = []
         self.experimental = _DummyExperimentalConfig()
 
@@ -1204,6 +1210,11 @@ class _DummyTfConfig:
 
     def set_visible_devices(self, devices, device_type):
         self.visible_device_calls.append((devices, device_type))
+        self.visible_gpus = list(devices)
+
+    def get_visible_devices(self, device_type):
+        assert device_type == "GPU"
+        return list(self.visible_gpus)
 
 
 def test_configure_tensorflow_devices_disables_gpu_when_requested(monkeypatch, capsys):
@@ -1215,6 +1226,16 @@ def test_configure_tensorflow_devices_disables_gpu_when_requested(monkeypatch, c
     assert dummy_config.visible_device_calls == [([], "GPU")]
     assert dummy_config.experimental.memory_growth_calls == []
     assert "TensorFlow GPU disabled. Using CPU only." in capsys.readouterr().out
+
+
+def test_configure_tensorflow_devices_disables_gpu_idempotently(monkeypatch):
+    dummy_config = _DummyTfConfig(gpus=["gpu0"])
+    monkeypatch.setattr(main_module.tf, "config", dummy_config)
+
+    main_module._configure_tensorflow_devices(use_gpu=False, verbose=False)
+    main_module._configure_tensorflow_devices(use_gpu=False, verbose=False)
+
+    assert dummy_config.visible_device_calls == [([], "GPU")]
 
 
 def test_configure_tensorflow_devices_enables_gpu_when_available(monkeypatch, capsys):
@@ -1229,6 +1250,23 @@ def test_configure_tensorflow_devices_enables_gpu_when_available(monkeypatch, ca
         ("gpu1", True),
     ]
     assert "TensorFlow GPU enabled with 2 device(s)." in capsys.readouterr().out
+
+
+def test_configure_tensorflow_devices_is_idempotent(monkeypatch):
+    dummy_config = _DummyTfConfig(gpus=["gpu0", "gpu1"])
+    monkeypatch.setattr(main_module.tf, "config", dummy_config)
+
+    main_module._configure_tensorflow_devices(
+        use_gpu=True, verbose=False, strict_memory_growth=True
+    )
+    main_module._configure_tensorflow_devices(
+        use_gpu=True, verbose=False, strict_memory_growth=True
+    )
+
+    assert dummy_config.experimental.memory_growth_calls == [
+        ("gpu0", True),
+        ("gpu1", True),
+    ]
 
 
 def test_configure_tensorflow_devices_falls_back_to_cpu_when_gpu_missing(monkeypatch, capsys):
@@ -1254,6 +1292,53 @@ def test_use_gpu_config_defaults_to_false_when_omitted(monkeypatch, capsys):
 
     assert dummy_config.visible_device_calls == [([], "GPU")]
     assert "TensorFlow GPU disabled. Using CPU only." in capsys.readouterr().out
+
+
+def test_main_configures_multistart_parent_before_dataset_runner(monkeypatch, tmp_path):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        "\n".join(
+            [
+                "dataset: Sim_Demand_Design_Mnist_IV",
+                "use_gpu: true",
+                "n_samples: 8",
+                "rho: 0.5",
+                "n_repeat: 1",
+                "egm_num_warm_starts: 10",
+                "egm_selection_top_k: 3",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    events = []
+
+    monkeypatch.setattr("sys.argv", ["main.py", "-c", str(config)])
+    monkeypatch.setattr(
+        main_module, "_apply_demand_design_benchmark_defaults", lambda params: None
+    )
+    monkeypatch.setattr(
+        main_module, "_validate_map_only_structural_config", lambda params: None
+    )
+
+    def configure(use_gpu, **kwargs):
+        events.append(("configure", use_gpu, kwargs))
+
+    def run(params):
+        events.append(("run", dict(params)))
+
+    monkeypatch.setattr(main_module, "_configure_tensorflow_devices", configure)
+    monkeypatch.setattr(main_module, "run_demand_design_mnist_iv", run)
+
+    main_module.main()
+
+    assert events[0] == (
+        "configure",
+        True,
+        {"strict_memory_growth": True},
+    )
+    assert events[1][0] == "run"
+    assert events[1][1]["egm_num_warm_starts"] == 10
 
 def _egm_params(tmp_path, **overrides):
     params = {
