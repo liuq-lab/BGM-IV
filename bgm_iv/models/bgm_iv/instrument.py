@@ -32,7 +32,13 @@ class BGM_IV(CausalBGM):
     binary treatments.
     """
 
-    def __init__(self, params, timestamp=None, random_seed=None):
+    def __init__(
+        self,
+        params,
+        timestamp=None,
+        random_seed=None,
+        auto_restore_checkpoint=True,
+    ):
         if "w_dim" not in params:
             raise KeyError("`w_dim` must be provided in params for BGM_IV.")
         if "alpha_v" in params:
@@ -53,8 +59,6 @@ class BGM_IV(CausalBGM):
         self.params.setdefault("egm_outcome_sigma", "residual_ema") 
         self.params.setdefault("egm_outcome_sigma_cap", 1.0)
         self.params.setdefault("egm_outcome_grad_path", "mean")  # "mean" | "stop"
-        # `mcmc_seed` seeds every test-time stochastic procedure.
-        self.params.setdefault("mcmc_seed", None)
         configured_scale = str(self.params.get("covariate_block_scale", "sum"))
         if configured_scale != "sum":
             raise ValueError("covariate blocks are fixed to event-sum reduction")
@@ -171,9 +175,36 @@ class BGM_IV(CausalBGM):
             self.ckpt, self.checkpoint_path, max_to_keep=5
         )
 
-        if self.ckpt_manager.latest_checkpoint:
+        if auto_restore_checkpoint and self.ckpt_manager.latest_checkpoint:
             self.ckpt.restore(self.ckpt_manager.latest_checkpoint)
             print("Latest checkpoint restored!!")
+
+    def make_model_state_checkpoint(self):
+        """Return the optimizer-free state transferred across phase boundaries."""
+        return tf.train.Checkpoint(
+            g_net=self.g_net,
+            e_net=self.e_net,
+            f_net=self.f_net,
+            h_net=self.h_net,
+            dz_net=self.dz_net,
+            egm_sigma2_x_ema=self.egm_sigma2_x_ema,
+        )
+
+    def save_model_state_checkpoint(self, checkpoint_prefix):
+        """Write model state plus TensorFlow's required save-counter metadata."""
+        checkpoint_prefix = os.fspath(checkpoint_prefix)
+        directory = os.path.dirname(checkpoint_prefix)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        checkpoint = self.make_model_state_checkpoint()
+        return checkpoint.save(checkpoint_prefix)
+
+    def restore_model_state_checkpoint(self, checkpoint_prefix):
+        """Restore a model-state checkpoint and require every value to match."""
+        checkpoint = self.make_model_state_checkpoint()
+        status = checkpoint.restore(os.fspath(checkpoint_prefix))
+        status.assert_consumed()
+        return status
 
     @staticmethod
     def _to_2d_float32(array):

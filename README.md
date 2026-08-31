@@ -136,7 +136,9 @@ egm_selection_top_k: 3
 ```
 
 All starts use the same complete training sample and optimization schedule but
-different, content-derived initialization seeds.  During the final ten EGM
+different initialization seeds derived from the cell's `run_seed`.  The same
+master seed also deterministically derives the shared schedule, selector draw,
+and post-EGM/BGM stream.  During the final ten EGM
 evaluation points, each start is scored by the same `l2_loss_y` term evaluated
 deterministically over every training row with the model's fixed eight-node
 Gauss--Hermite treatment integral.  No validation split, simulated holdout,
@@ -149,6 +151,12 @@ through BGM, MAP, encoder, and MCMC evaluation.  Omitting the fields defaults
 to the legacy single-start path (`1` start and top `1`).  The extra EGM starts
 are part of the estimator's compute budget and are not independent repeats.
 
+Candidate workers persist an optimizer-free `egm-transition` checkpoint.  It
+contains only the trained networks and EGM variance EMA needed to initialize
+the one BGM continuation; EGM optimizer slots are deliberately not resumable.
+After BGM, the training manifest binds a separate optimizer-free
+`inference-state` checkpoint used by structural evaluation and `--mcmc-only`.
+
 To restore a saved training checkpoint and run only structural evaluation and
 MCMC inference:
 
@@ -157,6 +165,13 @@ python main.py -c configs/Sim_Demand_Design_Mnist_IV.yaml \
   --set n_samples=5000 --set rho=0.5 --repeat-id 0 \
   --mcmc-only TIMESTAMP -t 1
 ```
+
+`--mcmc-only` restores the manifest-bound inference state, skips EGM,
+selection, and BGM, then reruns structural evaluation and full-grid MCMC from
+the beginning.  It does not resume a partially completed MCMC chain.  Empty or
+whitespace-only timestamps are rejected before training can start.  Pilot and
+production seeds remain deterministically derived from `run_seed`, MCMC
+family, checkpoint identity, and stage; there is no public `mcmc_seed` option.
 
 ## MNIST Cache
 

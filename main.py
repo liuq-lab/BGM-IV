@@ -309,6 +309,11 @@ def _apply_demand_design_benchmark_defaults(params):
             "`alpha_v` is no longer supported; test-time MAP uses the untempered "
             "covariate posterior."
         )
+    if "mcmc_seed" in params:
+        raise ValueError(
+            "`mcmc_seed` is no longer supported; full-grid MCMC derives and "
+            "records pilot/production seeds from run_seed and checkpoint identity."
+        )
     if dataset == "Sim_Demand_Design_IV" and "noise_seed" in params:
         raise ValueError(
             "`noise_seed` is no longer supported for Sim_Demand_Design_IV; "
@@ -352,7 +357,7 @@ def _apply_demand_design_benchmark_defaults(params):
             params[field_name] = expected
 
     normalized = validate_multistart_config(
-        params, mcmc_only=bool(params.get("_mcmc_only_timestamp"))
+        params, mcmc_only=_is_mcmc_only(params)
     )
     params.clear()
     params.update(normalized)
@@ -1356,13 +1361,32 @@ def _model_class_for_dataset(dataset):
 
 def _model_random_seed(params):
     run_seed = int(params.get("run_seed", params.get("seed", 0)))
-    params.setdefault("mcmc_seed", run_seed + 10007)
     return run_seed if bool(params.get("deterministic_training", False)) else None
+
+
+_MCMC_ONLY_TIMESTAMP_KEY = "_mcmc_only_timestamp"
+
+
+def _mcmc_only_timestamp(params):
+    """Return a validated restore timestamp or ``None`` for training mode."""
+    if _MCMC_ONLY_TIMESTAMP_KEY not in params:
+        return None
+    raw_timestamp = params[_MCMC_ONLY_TIMESTAMP_KEY]
+    if not isinstance(raw_timestamp, str):
+        raise ValueError("--mcmc-only requires a non-empty TIMESTAMP")
+    timestamp = raw_timestamp.strip()
+    if not timestamp:
+        raise ValueError("--mcmc-only requires a non-empty TIMESTAMP")
+    return timestamp
+
+
+def _is_mcmc_only(params):
+    return _mcmc_only_timestamp(params) is not None
 
 
 def _uses_egm_multistart(params):
     return (
-        not params.get("_mcmc_only_timestamp")
+        not _is_mcmc_only(params)
         and int(params.get("egm_num_warm_starts", 1)) > 1
     )
 
@@ -1474,6 +1498,7 @@ def _run_egm_candidate_worker(
                 params=candidate_params,
                 timestamp=f"egm_candidate_{int(candidate_id):02d}",
                 random_seed=int(init_seed),
+                auto_restore_checkpoint=False,
             )
             # Initialization is already materialized.  Reset every subsequent
             # stochastic training stream to the common schedule seed so only
@@ -1491,7 +1516,9 @@ def _run_egm_candidate_worker(
                 evaluation_callback=None,
                 score_iterations=evaluation_iterations,
             )
-            checkpoint_path = model.ckpt_manager.save(checkpoint_number=0)
+            checkpoint_path = model.save_model_state_checkpoint(
+                candidate_root_path / "egm-transition" / "ckpt"
+            )
             checkpoint_hash = _checkpoint_files_hash(checkpoint_path)
             checkpoint_weight_hash = sha256_json(
                 "egm-candidate-network-weights", _model_weight_hashes(model)
@@ -1523,6 +1550,9 @@ def _run_egm_candidate_worker(
                 candidate_id=int(candidate_id),
                 init_seed=int(init_seed),
                 schedule_seed=int(schedule_seed),
+                run_seed=int(
+                    candidate_params.get("run_seed", candidate_params.get("seed", 0))
+                ),
                 evaluation_iterations=evaluation_iterations,
                 full_train_l2_loss_y=scores,
                 status=status,
@@ -1595,8 +1625,14 @@ def _fit_demand_design_model_multistart(params, train):
     n_samples = int(normalized.get("n_samples", len(train["x"])))
     rho = float(normalized.get("rho", 0.5))
     repeat_id = int(normalized.get("repeat_id", 0))
+    run_seed = int(normalized.get("run_seed", normalized.get("seed", 0)))
     seeds = derive_multistart_seeds(
-        dataset, n_samples, rho, repeat_id, num_starts
+        dataset,
+        n_samples,
+        rho,
+        repeat_id,
+        num_starts,
+        run_seed=run_seed,
     )
     evaluation_iterations = score_evaluation_iterations(
         int(normalized.get("fit_egm_n_iter", 10000)),
@@ -1683,6 +1719,7 @@ def _fit_demand_design_model_multistart(params, train):
             "candidate_id": candidate_id,
             "init_seed": int(seeds["init_seeds"][candidate_id]),
             "schedule_seed": int(seeds["schedule_seed"]),
+            "run_seed": run_seed,
             "evaluation_iterations": list(evaluation_iterations),
             "data_hash": data_hash,
             "config_hash": config_hash,
@@ -1755,9 +1792,12 @@ def _fit_demand_design_model_multistart(params, train):
     tf.keras.utils.set_random_seed(int(seeds["post_egm_seed"]))
     np.random.seed(int(seeds["post_egm_seed"]))
     model_cls = _model_class_for_dataset(dataset)
-    model = model_cls(params=normalized, random_seed=int(seeds["post_egm_seed"]))
-    restore_status = model.ckpt.restore(selected_checkpoint)
-    restore_status.assert_existing_objects_matched()
+    model = model_cls(
+        params=normalized,
+        random_seed=int(seeds["post_egm_seed"]),
+        auto_restore_checkpoint=False,
+    )
+    model.restore_model_state_checkpoint(selected_checkpoint)
     restored_weight_hash = sha256_json(
         "egm-candidate-network-weights", _model_weight_hashes(model)
     )
@@ -1816,6 +1856,7 @@ def _fit_demand_design_model_multistart(params, train):
         ],
         "data_hash": data_hash,
         "config_hash": config_hash,
+        "run_seed": run_seed,
         "init_seeds": [int(value) for value in seeds["init_seeds"]],
         "schedule_seed": int(seeds["schedule_seed"]),
         "selector_seed": int(seeds["selector_seed"]),
@@ -1839,7 +1880,11 @@ def _fit_demand_design_model(params, train, evaluation_callback=None):
         return _fit_demand_design_model_multistart(params, train)
     model_cls = _model_class_for_dataset(params["dataset"])
     random_seed = _model_random_seed(params)
-    model = model_cls(params=params, random_seed=random_seed)
+    model = model_cls(
+        params=params,
+        random_seed=random_seed,
+        auto_restore_checkpoint=False,
+    )
     model.fit(
         data=(train["x"], train["y"], train["v"], train["w"]),
         epochs=int(params.get("fit_epochs", 100)),
@@ -1856,54 +1901,29 @@ def _fit_demand_design_model(params, train, evaluation_callback=None):
 
 
 def _restore_demand_design_model(params, timestamp, *, train=None, manifest_extra=None):
-    """Restore a pinned checkpoint and verify it against its training manifest.
-
-    Every variable of the model must be present in the checkpoint, and the
-    manifest written at training time must agree with the current dataset,
-    parameters, training data (when ``train`` is given), restored weights and
-    ``manifest_extra``; any mismatch fails instead of evaluating a model that
-    was not trained the way the run claims.
-    """
+    """Strictly restore a pinned optimizer-free inference-state checkpoint."""
+    timestamp = str(timestamp).strip()
+    if not timestamp:
+        raise ValueError("--mcmc-only requires a non-empty TIMESTAMP")
+    manifest = _load_training_manifest(params, timestamp)
     model_cls = _model_class_for_dataset(params["dataset"])
     random_seed = _model_random_seed(params)
-    model = model_cls(params=params, timestamp=str(timestamp), random_seed=random_seed)
-    if not model.ckpt_manager.latest_checkpoint:
-        raise FileNotFoundError(
-            f"no checkpoint to restore under {model.checkpoint_path}"
-        )
+    model = model_cls(
+        params=params,
+        timestamp=timestamp,
+        random_seed=random_seed,
+        auto_restore_checkpoint=False,
+    )
     if str(getattr(model, "timestamp", "")) != str(timestamp):
         raise RuntimeError("restored model timestamp differs from the requested one")
-    latest_checkpoint = model.ckpt_manager.latest_checkpoint
-    checkpoint_variable_names = {
-        name for name, _ in tf.train.list_variables(latest_checkpoint)
-    }
-    has_egm_ema = any(
-        name.startswith("egm_sigma2_x_ema/")
-        for name in checkpoint_variable_names
+    state_checkpoint, state_payload = _resolve_inference_state_checkpoint(
+        model, manifest
     )
-    if has_egm_ema:
-        status = model.ckpt.restore(latest_checkpoint)
-        status.assert_existing_objects_matched()
-    else:
-        # Checkpoints created before EGM multistart did not persist the EMA.
-        # Restore them through the exact legacy object graph rather than
-        # weakening the new schema with a broad ``expect_partial``.
-        legacy_ckpt = tf.train.Checkpoint(
-            g_net=model.g_net,
-            e_net=model.e_net,
-            f_net=model.f_net,
-            h_net=model.h_net,
-            dz_net=model.dz_net,
-            g_pre_optimizer=model.g_pre_optimizer,
-            d_pre_optimizer=model.d_pre_optimizer,
-            g_optimizer=model.g_optimizer,
-            f_optimizer=model.f_optimizer,
-            h_optimizer=model.h_optimizer,
-            posterior_optimizer=model.posterior_optimizer,
-        )
-        legacy_status = legacy_ckpt.restore(latest_checkpoint)
-        legacy_status.assert_existing_objects_matched()
-        print("Legacy checkpoint has no egm_sigma2_x_ema; strict legacy schema restored.")
+    model.restore_model_state_checkpoint(state_checkpoint)
+    if _model_state_hashes(model) != state_payload.get("state_hashes"):
+        raise RuntimeError("restored inference-state identity mismatch")
+    if _checkpoint_identity(model) != state_payload.get("checkpoint_identity"):
+        raise RuntimeError("restored checkpoint identity mismatch")
     model.training_history = []
     manifest = _verify_training_manifest(model, params, train, manifest_extra)
     multistart = (manifest.get("notes") or {}).get("egm_multistart")
@@ -1915,8 +1935,8 @@ def _restore_demand_design_model(params, timestamp, *, train=None, manifest_extr
 def _fit_or_restore_demand_design_model(
     params, train, evaluation_callback=None, manifest_extra=None, manifest_notes=None
 ):
-    timestamp = params.get("_mcmc_only_timestamp")
-    if timestamp:
+    timestamp = _mcmc_only_timestamp(params)
+    if timestamp is not None:
         print(f"Restoring checkpoint {timestamp} (mcmc-only; no training) ...")
         return _restore_demand_design_model(
             params, timestamp, train=train, manifest_extra=manifest_extra
@@ -2015,7 +2035,14 @@ def _load_training_manifest(params, timestamp):
         return json.load(handle)
 
 
-def _build_training_manifest(model, params, train, extra=None, notes=None):
+def _build_training_manifest(
+    model,
+    params,
+    train,
+    extra=None,
+    notes=None,
+    inference_state=None,
+):
     payload = {
         "schema_version": "bgm-training-manifest",
         "dataset": str(params["dataset"]),
@@ -2026,6 +2053,9 @@ def _build_training_manifest(model, params, train, extra=None, notes=None):
         "data": _training_data_hashes(train),
         "extra": json.loads(json.dumps(extra or {}, sort_keys=True, default=str)),
         "notes": json.loads(json.dumps(notes or {}, sort_keys=True, default=str)),
+        "inference_state": json.loads(
+            json.dumps(inference_state or {}, sort_keys=True, default=str)
+        ),
         "code_commit": _code_commit(),
         "execution_environment": execution_environment(),
     }
@@ -2037,15 +2067,51 @@ def _write_training_manifest(model, params, train, extra=None, notes=None):
     """Write the manifest once; a second write for the same checkpoint must agree."""
     if not bool(params.get("save_model")):
         return None
-    payload = _build_training_manifest(model, params, train, extra, notes)
     path = _training_manifest_path(model)
     if path.exists():
         with path.open("r", encoding="utf-8") as handle:
             existing = json.load(handle)
-        comparable = {key: existing.get(key) for key in ("checkpoint_identity", "params_hash", "data", "extra")}
+        inference_state = existing.get("inference_state")
+        if not isinstance(inference_state, dict) or not inference_state:
+            raise RuntimeError(
+                f"training manifest has no supported inference state: {path}"
+            )
+        _, resolved_state = _resolve_inference_state_checkpoint(model, existing)
+        if _model_state_hashes(model) != resolved_state.get("state_hashes"):
+            raise RuntimeError(f"training inference state differs from model: {path}")
+        payload = _build_training_manifest(
+            model,
+            params,
+            train,
+            extra,
+            notes,
+            inference_state=inference_state,
+        )
+        comparable = {
+            key: existing.get(key)
+            for key in (
+                "checkpoint_identity",
+                "weights",
+                "params_hash",
+                "data",
+                "extra",
+                "notes",
+                "code_commit",
+                "inference_state",
+            )
+        }
         if comparable != {key: payload[key] for key in comparable}:
             raise RuntimeError(f"training manifest already exists and differs: {path}")
         return existing
+    inference_state = _save_inference_state_checkpoint(model)
+    payload = _build_training_manifest(
+        model,
+        params,
+        train,
+        extra,
+        notes,
+        inference_state=inference_state,
+    )
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2, sort_keys=True)
@@ -2128,6 +2194,70 @@ def _checkpoint_files_hash(checkpoint_prefix):
     return sha256_json("tensorflow-checkpoint-files", {"files": files})
 
 
+def _model_state_hashes(model):
+    """Hashes for every value in the optimizer-free model-state checkpoint."""
+    return {
+        **_model_weight_hashes(model),
+        "dz": sha256_weights(model.dz_net),
+        "egm_sigma2_x_ema": sha256_array(model.egm_sigma2_x_ema.numpy()),
+    }
+
+
+def _save_inference_state_checkpoint(model):
+    checkpoint_root = Path(model.checkpoint_path)
+    checkpoint_prefix = Path(
+        model.save_model_state_checkpoint(
+            checkpoint_root / "inference-state" / "ckpt"
+        )
+    )
+    relative_prefix = checkpoint_prefix.relative_to(checkpoint_root)
+    payload = {
+        "checkpoint_kind": "inference-state",
+        "relative_prefix": relative_prefix.as_posix(),
+        "checkpoint_hash": _checkpoint_files_hash(checkpoint_prefix),
+        "checkpoint_identity": _checkpoint_identity(model),
+        "state_hashes": _model_state_hashes(model),
+    }
+    payload["inference_state_hash"] = sha256_json(
+        "bgm-inference-state", payload
+    )
+    return payload
+
+
+def _resolve_inference_state_checkpoint(model, manifest):
+    payload = manifest.get("inference_state")
+    if not isinstance(payload, dict):
+        raise RuntimeError(
+            "checkpoint manifest has no supported inference-state checkpoint"
+        )
+    if payload.get("checkpoint_kind") != "inference-state":
+        raise RuntimeError("checkpoint manifest has an invalid inference-state kind")
+    recorded_hash = payload.get("inference_state_hash")
+    unhashed = dict(payload)
+    unhashed.pop("inference_state_hash", None)
+    if recorded_hash != sha256_json("bgm-inference-state", unhashed):
+        raise RuntimeError("inference-state manifest hash mismatch")
+
+    relative_prefix = Path(str(payload.get("relative_prefix", "")))
+    if (
+        not relative_prefix.parts
+        or relative_prefix.is_absolute()
+        or ".." in relative_prefix.parts
+    ):
+        raise RuntimeError("inference-state checkpoint path is not relative and safe")
+    checkpoint_root = Path(model.checkpoint_path).resolve()
+    checkpoint_prefix = (checkpoint_root / relative_prefix).resolve()
+    if checkpoint_root not in checkpoint_prefix.parents:
+        raise RuntimeError("inference-state checkpoint escapes its checkpoint root")
+    if not Path(str(checkpoint_prefix) + ".index").is_file():
+        raise FileNotFoundError(
+            f"inference-state checkpoint is missing: {checkpoint_prefix}"
+        )
+    if _checkpoint_files_hash(checkpoint_prefix) != payload.get("checkpoint_hash"):
+        raise RuntimeError("inference-state checkpoint file hash mismatch")
+    return checkpoint_prefix, payload
+
+
 def _checkpoint_identity(model):
     weights = _model_weight_hashes(model)
     return sha256_json(
@@ -2180,7 +2310,7 @@ def _run_provenance(params, model, extra=None):
         "resolved_gamma": float(model._outcome_to_particles_weight()),
         "device_name": (gpus[0]["name"] if gpus else "cpu"),
         "execution_environment": environment,
-        "mcmc_only": bool(params.get("_mcmc_only_timestamp")),
+        "mcmc_only": _is_mcmc_only(params),
     }
     multistart = getattr(model, "egm_multistart_provenance", None)
     if multistart:
@@ -2690,7 +2820,6 @@ _PIXEL_STAGE_DROPPED_KEYS = (
     "sigma_noise_softfloor",
     "sigma_v",
     "sigma_v_softfloor",
-    "mcmc_seed",
     "_mcmc_only_timestamp",
 )
 
@@ -2763,8 +2892,9 @@ def _run_single_demand_design_mnist_feature_iv(params):
     # Under mcmc-only the stage-2 manifest names the exact stage-1
     # checkpoint; a retrained trunk would silently change the feature space.
     stage2_manifest = None
-    if params.get("_mcmc_only_timestamp"):
-        stage2_manifest = _load_training_manifest(params, params["_mcmc_only_timestamp"])
+    mcmc_only_timestamp = _mcmc_only_timestamp(params)
+    if mcmc_only_timestamp is not None:
+        stage2_manifest = _load_training_manifest(params, mcmc_only_timestamp)
     trunk = None
     pixel_identity = None
     if feature_map == "egm":
@@ -3208,10 +3338,13 @@ def main():
         if args.num_tasks != 1:
             raise ValueError("--repeat-id runs a single repeat; use -t 1.")
         params["_only_repeat_id"] = int(args.repeat_id)
-    if args.mcmc_only:
+    if args.mcmc_only is not None:
+        mcmc_only_timestamp = str(args.mcmc_only).strip()
+        if not mcmc_only_timestamp:
+            parser.error("--mcmc-only requires a non-empty TIMESTAMP")
         if args.repeat_id is None:
             raise ValueError("--mcmc-only requires --repeat-id.")
-        params["_mcmc_only_timestamp"] = str(args.mcmc_only)
+        params[_MCMC_ONLY_TIMESTAMP_KEY] = mcmc_only_timestamp
     _apply_demand_design_benchmark_defaults(params)
     _validate_map_only_structural_config(params)
     _validate_egm_multistart_run_shape(params)

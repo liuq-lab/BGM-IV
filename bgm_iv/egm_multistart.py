@@ -21,14 +21,15 @@ DEFAULT_EGM_NUM_WARM_STARTS = 1
 DEFAULT_EGM_SELECTION_TOP_K = 1
 EGM_SCORE_WINDOW_SIZE = 10
 EGM_SELECTOR_TEMPERATURE = 0.05
-EGM_SELECTOR_VERSION = "relative-loss-softmax-v1"
-EGM_CANDIDATE_MANIFEST_VERSION = "egm-candidate-manifest-v1"
-EGM_SELECTION_MANIFEST_VERSION = "egm-selection-manifest-v1"
+EGM_SELECTOR_VERSION = "relative-loss-softmax"
+EGM_CANDIDATE_MANIFEST_VERSION = "egm-candidate-manifest"
+EGM_SELECTION_MANIFEST_VERSION = "egm-selection-manifest"
 
-EGM_INIT_SEED_NAMESPACE = "egm-init-v1"
-EGM_SCHEDULE_SEED_NAMESPACE = "egm-schedule-v1"
-EGM_SELECTOR_SEED_NAMESPACE = "egm-selector-v1"
-POST_EGM_SEED_NAMESPACE = "post-egm-v1"
+EGM_INIT_SEED_NAMESPACE = "egm-init"
+EGM_SCHEDULE_SEED_NAMESPACE = "egm-schedule"
+EGM_SELECTOR_SEED_NAMESPACE = "egm-selector"
+POST_EGM_SEED_NAMESPACE = "post-egm"
+EGM_SELECTOR_DRAW_NAMESPACE = "selector-draw"
 
 _SEED_NAMESPACES = frozenset(
     {
@@ -161,12 +162,19 @@ def derive_multistart_seed(
     repeat_id: int,
     namespace: str,
     *,
+    run_seed: int,
     candidate_id: Optional[int] = None,
 ) -> int:
-    """Derive a stable positive 31-bit seed from the experiment identity."""
+    """Derive a stable positive 31-bit seed from the experiment identity.
+
+    ``run_seed`` is the cell-level master seed.  It is required explicitly so
+    changing the configured base seed changes every derived multistart stream
+    instead of only changing the simulated data.
+    """
 
     if not isinstance(dataset, str) or not dataset.strip():
         raise ValueError("dataset must be a non-empty string")
+    run_seed_value = _require_int("run_seed", run_seed, minimum=0)
     n_value = _require_int("n_samples", n_samples, minimum=1)
     repeat_value = _require_int("repeat_id", repeat_id, minimum=0)
     if isinstance(rho, bool) or not isinstance(rho, Real):
@@ -191,6 +199,7 @@ def derive_multistart_seed(
         candidate_value = None
 
     identity = {
+        "run_seed": run_seed_value,
         "dataset": dataset,
         "n_samples": n_value,
         "rho": format(rho_value, ".17g"),
@@ -213,6 +222,8 @@ def derive_multistart_seeds(
     rho: Real,
     repeat_id: int,
     num_warm_starts: int,
+    *,
+    run_seed: int,
 ) -> dict[str, Any]:
     """Derive all independent random streams for one outer data repeat."""
 
@@ -225,18 +236,19 @@ def derive_multistart_seeds(
             derive_multistart_seed(
                 *common,
                 EGM_INIT_SEED_NAMESPACE,
+                run_seed=run_seed,
                 candidate_id=candidate_id,
             )
             for candidate_id in range(count)
         ],
         "schedule_seed": derive_multistart_seed(
-            *common, EGM_SCHEDULE_SEED_NAMESPACE
+            *common, EGM_SCHEDULE_SEED_NAMESPACE, run_seed=run_seed
         ),
         "selector_seed": derive_multistart_seed(
-            *common, EGM_SELECTOR_SEED_NAMESPACE
+            *common, EGM_SELECTOR_SEED_NAMESPACE, run_seed=run_seed
         ),
         "post_egm_seed": derive_multistart_seed(
-            *common, POST_EGM_SEED_NAMESPACE
+            *common, POST_EGM_SEED_NAMESPACE, run_seed=run_seed
         ),
     }
 
@@ -349,7 +361,9 @@ def selector_uniform_draw(selector_seed: int) -> float:
 
     seed = _require_int("selector_seed", selector_seed, minimum=0)
     digest = hashlib.sha256(
-        f"{EGM_SELECTOR_VERSION}\0selector-draw-v1\0{seed}".encode("utf-8")
+        f"{EGM_SELECTOR_VERSION}\0{EGM_SELECTOR_DRAW_NAMESPACE}\0{seed}".encode(
+            "utf-8"
+        )
     ).digest()
     integer = int.from_bytes(digest[:8], "big")
     return integer / float(2**64)
@@ -439,6 +453,7 @@ def make_candidate_manifest(
     candidate_id: int,
     init_seed: int,
     schedule_seed: int,
+    run_seed: int,
     evaluation_iterations: Sequence[int],
     full_train_l2_loss_y: Sequence[Any],
     status: str,
@@ -460,6 +475,7 @@ def make_candidate_manifest(
     candidate_value = _candidate_id(candidate_id)
     init_value = _require_int("init_seed", init_seed, minimum=0)
     schedule_value = _require_int("schedule_seed", schedule_seed, minimum=0)
+    run_seed_value = _require_int("run_seed", run_seed, minimum=0)
     iterations = [
         _require_int("evaluation iteration", value, minimum=0)
         for value in evaluation_iterations
@@ -492,6 +508,7 @@ def make_candidate_manifest(
         "candidate_id": candidate_value,
         "init_seed": init_value,
         "schedule_seed": schedule_value,
+        "run_seed": run_seed_value,
         "evaluation_iterations": iterations,
         "full_train_l2_loss_y": scores,
         "tail_mean_score": tail_score,
@@ -549,6 +566,7 @@ __all__ = [
     "EGM_SCORE_WINDOW_SIZE",
     "EGM_SELECTION_MANIFEST_VERSION",
     "EGM_SELECTOR_SEED_NAMESPACE",
+    "EGM_SELECTOR_DRAW_NAMESPACE",
     "EGM_SELECTOR_TEMPERATURE",
     "EGM_SELECTOR_VERSION",
     "MultistartConfigurationError",

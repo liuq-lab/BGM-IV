@@ -86,6 +86,38 @@ def _make_image_params(output_dir):
     }
 
 
+def test_image_model_state_checkpoint_is_strict_and_optimizer_free(tmp_path):
+    params = _make_image_params(tmp_path)
+    model = BGM_IV_Image(params=params, random_seed=13)
+    model.egm_sigma2_x_ema.assign(0.321)
+    expected = main_module._model_state_hashes(model)
+    checkpoint = model.save_model_state_checkpoint(
+        tmp_path / "inference-state" / "ckpt"
+    )
+    variable_names = [name for name, _ in tf.train.list_variables(checkpoint)]
+    assert not any("optimizer" in name.lower() for name in variable_names)
+    assert not any("data_z" in name for name in variable_names)
+    allowed_roots = (
+        "g_net/",
+        "e_net/",
+        "f_net/",
+        "h_net/",
+        "dz_net/",
+        "egm_sigma2_x_ema/",
+        "save_counter/",
+        "_CHECKPOINTABLE_OBJECT_GRAPH",
+    )
+    assert all(name.startswith(allowed_roots) for name in variable_names)
+
+    restored = BGM_IV_Image(
+        params=params,
+        random_seed=99,
+        auto_restore_checkpoint=False,
+    )
+    restored.restore_model_state_checkpoint(checkpoint)
+    assert main_module._model_state_hashes(restored) == expected
+
+
 def test_simulate_demand_design_mnist_iv_matches_reference_construction(fake_mnist):
     seed = 7
     train = simulate_demand_design_mnist_iv(n_samples=12, rho=0.5, seed=seed, v_dim=785)

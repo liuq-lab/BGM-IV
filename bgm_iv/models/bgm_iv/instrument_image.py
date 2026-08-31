@@ -8,14 +8,25 @@ from ..networks import DemandImageCovariateDecoder, DemandImageEncoder
 class BGM_IV_Image(BGM_IV):
     """Image-aware IV model for the MNIST demand-design benchmark."""
 
-    def __init__(self, params, timestamp=None, random_seed=None):
+    def __init__(
+        self,
+        params,
+        timestamp=None,
+        random_seed=None,
+        auto_restore_checkpoint=True,
+    ):
         params = dict(params)
         if int(params.get("v_dim", 0)) < 785:
             raise ValueError("`BGM_IV_Image` requires `v_dim >= 785`.")
         if int(params.get("w_dim", 0)) != 1:
             raise ValueError("`BGM_IV_Image` requires `w_dim == 1`.")
 
-        super().__init__(params=params, timestamp=timestamp, random_seed=random_seed)
+        super().__init__(
+            params=params,
+            timestamp=timestamp,
+            random_seed=random_seed,
+            auto_restore_checkpoint=False,
+        )
 
         z_dim = sum(self.params["z_dims"])
         self.image_dim = 28 * 28
@@ -58,7 +69,7 @@ class BGM_IV_Image(BGM_IV):
         self.ckpt_manager = tf.train.CheckpointManager(
             self.ckpt, self.checkpoint_path, max_to_keep=5
         )
-        if self.ckpt_manager.latest_checkpoint:
+        if auto_restore_checkpoint and self.ckpt_manager.latest_checkpoint:
             self.ckpt.restore(self.ckpt_manager.latest_checkpoint)
             print("Latest checkpoint restored!!")
 

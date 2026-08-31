@@ -399,6 +399,12 @@ def test_benchmark_defaults_reject_alpha_v():
         main_module._apply_demand_design_benchmark_defaults(params)
 
 
+def test_benchmark_defaults_reject_dead_mcmc_seed():
+    params = {"dataset": "Sim_Demand_Design_IV", "mcmc_seed": 1234}
+    with pytest.raises(ValueError, match="mcmc_seed.*no longer supported"):
+        main_module._apply_demand_design_benchmark_defaults(params)
+
+
 def test_benchmark_defaults_accept_backward_compatible_default_values():
     params = {
         "dataset": "Sim_Demand_Design_IV",
@@ -467,6 +473,42 @@ def test_build_arg_parser_uses_mcmc_only_and_rejects_removed_flag():
     assert args.mcmc_only == "stamp"
     with pytest.raises(SystemExit):
         parser.parse_args(["-c", "x.yaml", "--certify-only", "stamp"])
+
+
+@pytest.mark.parametrize("value", ["", "   ", None, 123])
+def test_internal_mcmc_only_marker_rejects_invalid_timestamp(value):
+    with pytest.raises(ValueError, match="non-empty TIMESTAMP"):
+        main_module._mcmc_only_timestamp({"_mcmc_only_timestamp": value})
+
+
+def test_mcmc_only_marker_distinguishes_training_and_restore_modes():
+    assert main_module._mcmc_only_timestamp({}) is None
+    assert main_module._mcmc_only_timestamp(
+        {"_mcmc_only_timestamp": "  checkpoint_1  "}
+    ) == "checkpoint_1"
+
+
+@pytest.mark.parametrize("timestamp", ["", "   "])
+def test_main_rejects_empty_mcmc_only_before_creating_artifacts(
+    monkeypatch, tmp_path, timestamp
+):
+    config = tmp_path / "config.yaml"
+    config.write_text("dataset: Sim_Demand_Design_Vector_IV\n", encoding="utf-8")
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "main.py",
+            "-c",
+            str(config),
+            "--mcmc-only",
+            timestamp,
+            "--repeat-id",
+            "0",
+        ],
+    )
+    with pytest.raises(SystemExit):
+        main_module.main()
+    assert list(tmp_path.iterdir()) == [config]
 
 
 def test_resolve_parallel_gpu_slots_rejects_oversubscription(monkeypatch):
@@ -1342,10 +1384,35 @@ def test_training_manifest_binds_checkpoint_params_and_data(tmp_path):
     assert manifest["checkpoint_identity"] == main_module._checkpoint_identity(model)
     assert set(manifest["data"]) == {"x", "y", "v", "w"}
     assert "output_dir" not in manifest["params"] and "lr" in manifest["params"]
+    assert "mcmc_seed" not in manifest["params"]
+    inference_state = manifest["inference_state"]
+    assert inference_state["checkpoint_kind"] == "inference-state"
+    state_prefix = Path(model.checkpoint_path) / inference_state["relative_prefix"]
+    state_variables = [name for name, _ in tf.train.list_variables(str(state_prefix))]
+    assert not any("optimizer" in name.lower() for name in state_variables)
+    assert not any("data_z" in name for name in state_variables)
+    allowed_roots = (
+        "g_net/",
+        "e_net/",
+        "f_net/",
+        "h_net/",
+        "dz_net/",
+        "egm_sigma2_x_ema/",
+        "save_counter/",
+        "_CHECKPOINTABLE_OBJECT_GRAPH",
+    )
+    assert all(name.startswith(allowed_roots) for name in state_variables)
     # a second write for the same checkpoint must agree
     assert main_module._write_training_manifest(model, params, train) == manifest
     with pytest.raises(RuntimeError, match="differs"):
         main_module._write_training_manifest(model, params, {**train, "y": train["y"] + 1.0})
+    with pytest.raises(RuntimeError, match="differs"):
+        main_module._write_training_manifest(
+            model,
+            params,
+            train,
+            notes={"egm_multistart": {"selected_candidate_id": 9}},
+        )
 
     restored = main_module._restore_demand_design_model(params, model.timestamp, train=train)
     assert main_module._checkpoint_identity(restored) == manifest["checkpoint_identity"]
@@ -1366,6 +1433,80 @@ def test_training_manifest_binds_checkpoint_params_and_data(tmp_path):
     path.unlink()
     with pytest.raises(FileNotFoundError, match="manifest"):
         main_module._restore_demand_design_model(params, model.timestamp, train=train)
+
+
+def test_mcmc_only_restores_inference_state_without_training(monkeypatch, tmp_path):
+    params = _manifest_model_params(tmp_path)
+    rng = np.random.default_rng(10)
+    train = {
+        "x": rng.normal(size=(6, 1)).astype(np.float32),
+        "y": rng.normal(size=(6, 1)).astype(np.float32),
+        "v": rng.normal(size=(6, 2)).astype(np.float32),
+        "w": rng.normal(size=(6, 1)).astype(np.float32),
+    }
+    model = BGM_IV(params=params, random_seed=7)
+    model.ckpt_manager.save(0)
+    selection_provenance = {
+        "egm_num_warm_starts": 10,
+        "egm_selection_top_k": 3,
+        "egm_selected_candidate_id": 4,
+        "egm_selected_rank": 2,
+    }
+    main_module._write_training_manifest(
+        model,
+        params,
+        train,
+        notes={"egm_multistart": selection_provenance},
+    )
+    expected_identity = main_module._checkpoint_identity(model)
+
+    monkeypatch.setattr(
+        main_module,
+        "_fit_demand_design_model",
+        lambda *args, **kwargs: pytest.fail("mcmc-only attempted training"),
+    )
+    restore_params = {
+        **params,
+        "_mcmc_only_timestamp": str(model.timestamp),
+    }
+    restored = main_module._fit_or_restore_demand_design_model(
+        restore_params,
+        train,
+    )
+    assert main_module._checkpoint_identity(restored) == expected_identity
+    assert main_module._is_mcmc_only(restore_params)
+    assert restored.egm_multistart_provenance == selection_provenance
+    from bgm_iv.mcmc.inference import derive_mcmc_seeds
+
+    assert derive_mcmc_seeds("demand", 0, expected_identity) == derive_mcmc_seeds(
+        "demand",
+        0,
+        main_module._checkpoint_identity(restored),
+    )
+
+
+def test_mcmc_only_rejects_manifest_without_inference_state(tmp_path):
+    params = _manifest_model_params(tmp_path)
+    rng = np.random.default_rng(11)
+    train = {
+        "x": rng.normal(size=(6, 1)).astype(np.float32),
+        "y": rng.normal(size=(6, 1)).astype(np.float32),
+        "v": rng.normal(size=(6, 2)).astype(np.float32),
+        "w": rng.normal(size=(6, 1)).astype(np.float32),
+    }
+    model = BGM_IV(params=params, random_seed=7)
+    model.ckpt_manager.save(0)
+    manifest = main_module._write_training_manifest(model, params, train)
+    manifest.pop("inference_state")
+    manifest_path = Path(model.checkpoint_path) / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="no supported inference-state"):
+        main_module._restore_demand_design_model(
+            params,
+            model.timestamp,
+            train=train,
+        )
 
 
 def test_holdout_criterion_uses_observed_outcome_and_instrument(tmp_path):

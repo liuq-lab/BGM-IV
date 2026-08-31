@@ -26,6 +26,7 @@ class _ImmediateExecutor:
         return False
 
     def submit(self, fn, candidate_id, params, train, **kwargs):
+        run_seed = int(params.get("run_seed", params.get("seed", 0)))
         del fn, params, train
         candidate_root = Path(kwargs["candidate_root"])
         candidate_root.mkdir(parents=True, exist_ok=True)
@@ -42,6 +43,7 @@ class _ImmediateExecutor:
             candidate_id=int(candidate_id),
             init_seed=int(kwargs["init_seed"]),
             schedule_seed=int(kwargs["schedule_seed"]),
+            run_seed=run_seed,
             evaluation_iterations=kwargs["evaluation_iterations"],
             full_train_l2_loss_y=scores,
             status="completed",
@@ -92,12 +94,16 @@ class _Checkpoint:
 
 
 class _FakeWinnerModel:
-    def __init__(self, params, random_seed):
+    def __init__(self, params, random_seed, auto_restore_checkpoint=True):
         self.params = dict(params)
         self.random_seed = int(random_seed)
+        self.auto_restore_checkpoint = bool(auto_restore_checkpoint)
         self.ckpt = _Checkpoint()
         self.training_history = []
         self.bgm_calls = 0
+
+    def restore_model_state_checkpoint(self, path):
+        return self.ckpt.restore(path)
 
     def fit_bgm_from_egm(self, **kwargs):
         self.bgm_calls += 1

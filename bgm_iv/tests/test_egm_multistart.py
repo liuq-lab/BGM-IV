@@ -5,9 +5,14 @@ import pytest
 
 from bgm_iv.egm_multistart import (
     CandidateSelectionError,
+    EGM_CANDIDATE_MANIFEST_VERSION,
     EGM_INIT_SEED_NAMESPACE,
+    EGM_SCHEDULE_SEED_NAMESPACE,
     EGM_SCORE_WINDOW_SIZE,
+    EGM_SELECTION_MANIFEST_VERSION,
+    EGM_SELECTOR_DRAW_NAMESPACE,
     EGM_SELECTOR_TEMPERATURE,
+    EGM_SELECTOR_VERSION,
     MultistartConfigurationError,
     derive_multistart_seed,
     derive_multistart_seeds,
@@ -86,8 +91,12 @@ def test_score_window_fails_instead_of_silently_shortening():
 
 
 def test_seed_derivation_is_reproducible_and_namespaced():
-    seeds = derive_multistart_seeds("vector", 5_000, 0.5, 7, 10)
-    assert seeds == derive_multistart_seeds("vector", 5_000, 0.5, 7, 10)
+    seeds = derive_multistart_seeds(
+        "vector", 5_000, 0.5, 7, 10, run_seed=107
+    )
+    assert seeds == derive_multistart_seeds(
+        "vector", 5_000, 0.5, 7, 10, run_seed=107
+    )
     assert len(seeds["init_seeds"]) == 10
     assert len(set(seeds["init_seeds"])) == 10
     assert all(0 < seed < 2**31 - 1 for seed in seeds["init_seeds"])
@@ -99,13 +108,42 @@ def test_seed_derivation_is_reproducible_and_namespaced():
             seeds["post_egm_seed"],
         }
     ) == 13
-    assert seeds != derive_multistart_seeds("vector", 5_000, 0.5, 8, 10)
+    assert seeds != derive_multistart_seeds(
+        "vector", 5_000, 0.5, 8, 10, run_seed=108
+    )
+
+
+def test_seed_derivation_changes_every_stream_with_master_run_seed():
+    first = derive_multistart_seeds(
+        "vector", 5_000, 0.5, 7, 10, run_seed=107
+    )
+    second = derive_multistart_seeds(
+        "vector", 5_000, 0.5, 7, 10, run_seed=108
+    )
+    assert first["init_seeds"] != second["init_seeds"]
+    assert first["schedule_seed"] != second["schedule_seed"]
+    assert first["selector_seed"] != second["selector_seed"]
+    assert first["post_egm_seed"] != second["post_egm_seed"]
+
+
+def test_multistart_contract_names_are_versionless():
+    assert EGM_SELECTOR_VERSION == "relative-loss-softmax"
+    assert EGM_CANDIDATE_MANIFEST_VERSION == "egm-candidate-manifest"
+    assert EGM_SELECTION_MANIFEST_VERSION == "egm-selection-manifest"
+    assert EGM_INIT_SEED_NAMESPACE == "egm-init"
+    assert EGM_SCHEDULE_SEED_NAMESPACE == "egm-schedule"
+    assert EGM_SELECTOR_DRAW_NAMESPACE == "selector-draw"
 
 
 def test_init_seed_requires_candidate_and_other_streams_forbid_it():
     with pytest.raises(ValueError, match="candidate_id is required"):
         derive_multistart_seed(
-            "vector", 5_000, 0.5, 0, EGM_INIT_SEED_NAMESPACE
+            "vector",
+            5_000,
+            0.5,
+            0,
+            EGM_INIT_SEED_NAMESPACE,
+            run_seed=0,
         )
     with pytest.raises(ValueError, match="only valid"):
         derive_multistart_seed(
@@ -113,7 +151,8 @@ def test_init_seed_requires_candidate_and_other_streams_forbid_it():
             5_000,
             0.5,
             0,
-            "egm-schedule-v1",
+            EGM_SCHEDULE_SEED_NAMESPACE,
+            run_seed=0,
             candidate_id=0,
         )
 
@@ -205,6 +244,7 @@ def test_candidate_manifest_is_json_safe_self_hashed_and_uses_tail_mean():
         candidate_id=2,
         init_seed=11,
         schedule_seed=12,
+        run_seed=10,
         evaluation_iterations=iterations,
         full_train_l2_loss_y=scores,
         status="completed",
@@ -221,6 +261,7 @@ def test_candidate_manifest_is_json_safe_self_hashed_and_uses_tail_mean():
         device_hash="f" * 64,
     )
     assert payload["tail_mean_score"] == pytest.approx(sum(scores) / 10)
+    assert payload["run_seed"] == 10
     assert payload["worker_pid"] == 1234
     assert payload["device_names"] == ["/device:GPU:0"]
     assert payload["device_hash"] == "f" * 64
@@ -239,6 +280,7 @@ def test_candidate_manifest_serializes_nonfinite_loss_as_null():
         candidate_id=2,
         init_seed=11,
         schedule_seed=12,
+        run_seed=10,
         evaluation_iterations=score_evaluation_iterations(1_000, 100),
         full_train_l2_loss_y=scores,
         status="nonfinite_score",

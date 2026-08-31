@@ -8,7 +8,13 @@ from ..networks import DemandVectorCovariateDecoder, DemandVectorEncoder
 class BGM_IV_Vector(BGM_IV):
     """Vector-aware IV model for the demand-design proxy benchmark."""
 
-    def __init__(self, params, timestamp=None, random_seed=None):
+    def __init__(
+        self,
+        params,
+        timestamp=None,
+        random_seed=None,
+        auto_restore_checkpoint=True,
+    ):
         params = dict(params)
         self.vector_dim = int(params.get("vector_dim", 784))
         if int(params.get("v_dim", 0)) != 1 + self.vector_dim:
@@ -16,7 +22,12 @@ class BGM_IV_Vector(BGM_IV):
         if int(params.get("w_dim", 0)) != 1:
             raise ValueError("`BGM_IV_Vector` requires `w_dim == 1`.")
 
-        super().__init__(params=params, timestamp=timestamp, random_seed=random_seed)
+        super().__init__(
+            params=params,
+            timestamp=timestamp,
+            random_seed=random_seed,
+            auto_restore_checkpoint=False,
+        )
 
         z_dim = sum(self.params["z_dims"])
         self.vector_dim = int(self.params.get("vector_dim", 784))
@@ -51,7 +62,7 @@ class BGM_IV_Vector(BGM_IV):
         self.ckpt_manager = tf.train.CheckpointManager(
             self.ckpt, self.checkpoint_path, max_to_keep=5
         )
-        if self.ckpt_manager.latest_checkpoint:
+        if auto_restore_checkpoint and self.ckpt_manager.latest_checkpoint:
             self.ckpt.restore(self.ckpt_manager.latest_checkpoint)
             print("Latest checkpoint restored!!")
 

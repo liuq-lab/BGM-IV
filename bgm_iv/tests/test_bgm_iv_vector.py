@@ -310,14 +310,32 @@ def test_restored_pure_egm_checkpoint_continues_one_bgm_epoch(tmp_path):
         verbose=0,
         score_iterations=[0],
     )
-    checkpoint = candidate.ckpt_manager.save(checkpoint_number=0)
+    checkpoint = candidate.save_model_state_checkpoint(
+        tmp_path / "egm-transition" / "ckpt"
+    )
+    variable_names = [name for name, _ in tf.train.list_variables(checkpoint)]
+    assert not any("optimizer" in name.lower() for name in variable_names)
+    assert not any("data_z" in name for name in variable_names)
+    allowed_roots = (
+        "g_net/",
+        "e_net/",
+        "f_net/",
+        "h_net/",
+        "dz_net/",
+        "egm_sigma2_x_ema/",
+        "save_counter/",
+        "_CHECKPOINTABLE_OBJECT_GRAPH",
+    )
+    assert all(name.startswith(allowed_roots) for name in variable_names)
     post_egm_history = list(candidate.training_history)
 
     restored = BGM_IV_Vector(
-        params=params, timestamp="phase_split_restored", random_seed=99
+        params=params,
+        timestamp="phase_split_restored",
+        random_seed=99,
+        auto_restore_checkpoint=False,
     )
-    status = restored.ckpt.restore(checkpoint)
-    status.assert_existing_objects_matched()
+    restored.restore_model_state_checkpoint(checkpoint)
     restored.training_history = post_egm_history
     history = restored.fit_bgm_from_egm(
         data,
