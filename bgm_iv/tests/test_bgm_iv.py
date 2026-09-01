@@ -475,6 +475,214 @@ def test_build_arg_parser_uses_mcmc_only_and_rejects_removed_flag():
         parser.parse_args(["-c", "x.yaml", "--certify-only", "stamp"])
 
 
+def test_mcmc_ablation_cli_normalizes_private_inference_options():
+    parser = main_module._build_arg_parser()
+    args = parser.parse_args(
+        [
+            "-c",
+            "x.yaml",
+            "--mcmc-only",
+            "stamp",
+            "--mcmc-production-warmup-steps",
+            "2000",
+            "--mcmc-production-draws",
+            "5000",
+            "--mcmc-artifact-root",
+            "/tmp/artifacts",
+            "--mcmc-arm-id",
+            "w2000_d5000",
+            "--mcmc-readout-prefixes",
+            "5000, 3000,4000,3000",
+            "--mcmc-reference-map-mse",
+            "12.5",
+            "--mcmc-reference-encoder-mse",
+            "13.5",
+        ]
+    )
+    params = {"_mcmc_only_timestamp": "stamp"}
+    main_module._apply_mcmc_inference_cli(params, args)
+
+    assert params[main_module._MCMC_INFERENCE_OPTIONS_KEY] == {
+        "production_warmup_steps": 2000,
+        "production_draws": 5000,
+        "artifact_root": "/tmp/artifacts",
+        "arm_id": "w2000_d5000",
+        "readout_prefixes": [3000, 4000, 5000],
+        "readout_artifact_manifest": None,
+        "reference_metrics": {"map": 12.5, "encoder": 13.5},
+    }
+
+
+@pytest.mark.parametrize(
+    "extra,match",
+    [
+        (["--mcmc-production-warmup-steps", "2000"], "provided together"),
+        (
+            [
+                "--mcmc-production-warmup-steps",
+                "2000",
+                "--mcmc-production-draws",
+                "5000",
+                "--mcmc-readout-prefixes",
+                "3000,6000",
+            ],
+            "cannot exceed",
+        ),
+        (["--mcmc-artifact-root", "/tmp/artifacts"], "provided together"),
+        (["--mcmc-arm-id", "bad/arm"], "provided together"),
+    ],
+)
+def test_mcmc_ablation_cli_rejects_invalid_combinations(extra, match):
+    parser = main_module._build_arg_parser()
+    args = parser.parse_args(["-c", "x.yaml", "--mcmc-only", "stamp", *extra])
+    with pytest.raises(ValueError, match=match):
+        main_module._apply_mcmc_inference_cli(
+            {"_mcmc_only_timestamp": "stamp"}, args
+        )
+
+
+def test_mcmc_ablation_cli_requires_restore_mode_and_is_manifest_excluded():
+    parser = main_module._build_arg_parser()
+    args = parser.parse_args(
+        [
+            "-c",
+            "x.yaml",
+            "--mcmc-production-warmup-steps",
+            "2000",
+            "--mcmc-production-draws",
+            "5000",
+        ]
+    )
+    with pytest.raises(ValueError, match="require --mcmc-only"):
+        main_module._apply_mcmc_inference_cli({}, args)
+
+    base = {"dataset": "Sim_Demand_Design_Mnist_IV", "fit_epochs": 200}
+    private = {
+        **base,
+        main_module._MCMC_INFERENCE_OPTIONS_KEY: {
+            "production_warmup_steps": 2000,
+            "production_draws": 5000,
+        },
+    }
+    assert main_module._manifest_params(private) == main_module._manifest_params(base)
+
+
+def test_mcmc_readout_artifact_allows_prefixes_and_rejects_production_options():
+    parser = main_module._build_arg_parser()
+    args = parser.parse_args(
+        [
+            "-c",
+            "x.yaml",
+            "--mcmc-only",
+            "stamp",
+            "--mcmc-readout-artifact",
+            "/tmp/arm/manifest.json",
+            "--mcmc-readout-prefixes",
+            "3000,4000,5000",
+            "--mcmc-reference-map-mse",
+            "1.25",
+        ]
+    )
+    params = {"_mcmc_only_timestamp": "stamp"}
+    main_module._apply_mcmc_inference_cli(params, args)
+    options = params[main_module._MCMC_INFERENCE_OPTIONS_KEY]
+    assert options["readout_artifact_manifest"] == "/tmp/arm/manifest.json"
+    assert options["readout_prefixes"] == [3000, 4000, 5000]
+    assert options["reference_metrics"] == {"map": 1.25}
+
+    conflicting = parser.parse_args(
+        [
+            "-c",
+            "x.yaml",
+            "--mcmc-only",
+            "stamp",
+            "--mcmc-readout-artifact",
+            "/tmp/arm/manifest.json",
+            "--mcmc-production-warmup-steps",
+            "2000",
+            "--mcmc-production-draws",
+            "5000",
+        ]
+    )
+    with pytest.raises(ValueError, match="cannot be combined"):
+        main_module._apply_mcmc_inference_cli(
+            {"_mcmc_only_timestamp": "stamp"}, conflicting
+        )
+
+
+def test_run_structural_mcmc_passes_ablation_options_and_records_references(
+    monkeypatch, tmp_path
+):
+    captured = {}
+
+    def fake_run_mcmc_grid(model, **kwargs):
+        captured.update(kwargs)
+        return {"readout": {"structural_mse_plugin": 3.0}}
+
+    monkeypatch.setattr(main_module, "run_mcmc_grid", fake_run_mcmc_grid)
+    monkeypatch.setattr(main_module, "_checkpoint_identity", lambda model: "identity")
+    params = {
+        "dataset": "Sim_Demand_Design_Mnist_IV",
+        "repeat_id": 0,
+        "seed": 0,
+        main_module._MCMC_INFERENCE_OPTIONS_KEY: {
+            "production_warmup_steps": 3000,
+            "production_draws": 5000,
+            "artifact_root": str(tmp_path),
+            "arm_id": "w3000_d5000",
+            "readout_prefixes": [3000, 4000, 5000],
+            "readout_artifact_manifest": None,
+            "reference_metrics": {"map": 1.0, "encoder": 2.0},
+        },
+    }
+    model = type("Model", (), {"timestamp": "stamp"})()
+    record = main_module._run_structural_mcmc(
+        model,
+        params,
+        family="mnist_pixel",
+        grid_x_model=np.zeros((2, 1), np.float32),
+        grid_v_raw=np.zeros((2, 2), np.float32),
+        truth_rows=np.zeros(2, np.float32),
+        truth_label="truth",
+        preprocessor=object(),
+        x_stats={"mean": np.asarray([0.0]), "scale": np.asarray([1.0])},
+        y_stats={"mean": np.asarray([0.0]), "scale": np.asarray([1.0])},
+    )
+
+    assert captured["production_warmup_steps"] == 3000
+    assert captured["production_draws"] == 5000
+    assert captured["artifact_root"] == str(tmp_path)
+    assert captured["arm_id"] == "w3000_d5000"
+    assert captured["readout_prefixes"] == [3000, 4000, 5000]
+    assert captured["readout_artifact_manifest"] is None
+    assert record["reference_metrics"] == {"map": 1.0, "encoder": 2.0}
+
+    params[main_module._MCMC_INFERENCE_OPTIONS_KEY] = {
+        "production_warmup_steps": None,
+        "production_draws": None,
+        "artifact_root": None,
+        "arm_id": None,
+        "readout_prefixes": [3000, 4000],
+        "readout_artifact_manifest": "/tmp/existing/manifest.json",
+        "reference_metrics": {"map": 1.0, "encoder": 2.0},
+    }
+    captured.clear()
+    main_module._run_structural_mcmc(
+        model,
+        params,
+        family="mnist_pixel",
+        grid_x_model=np.zeros((2, 1), np.float32),
+        grid_v_raw=np.zeros((2, 2), np.float32),
+        truth_rows=np.zeros(2, np.float32),
+        truth_label="truth",
+        preprocessor=object(),
+        x_stats={"mean": np.asarray([0.0]), "scale": np.asarray([1.0])},
+        y_stats={"mean": np.asarray([0.0]), "scale": np.asarray([1.0])},
+    )
+    assert captured["readout_artifact_manifest"] == "/tmp/existing/manifest.json"
+    assert captured["readout_prefixes"] == [3000, 4000]
+
+
 @pytest.mark.parametrize("value", ["", "   ", None, 123])
 def test_internal_mcmc_only_marker_rejects_invalid_timestamp(value):
     with pytest.raises(ValueError, match="non-empty TIMESTAMP"):

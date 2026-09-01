@@ -18,6 +18,11 @@ from typing import Any, Callable, Mapping, Optional, Sequence
 import numpy as np
 import tensorflow as tf
 
+from .artifact import (
+    MCMCDrawArtifactError,
+    load_draw_artifact,
+    save_draw_artifact,
+)
 from .readout import FullGridReadout, ReadoutConfig, build_query_table
 from .sampler import (
     FrozenBatch,
@@ -401,6 +406,7 @@ def run_mcmc(
             f"min={float(np.min(segment.acceptance_rate)):.3f}, "
             f"per-chain={np.round(per_chain, 3).tolist()}"
         )
+    per_chain = np.mean(segment.acceptance_rate, axis=1)
     return {
         "draws": segment.draws,
         "seconds": float(seconds),
@@ -408,6 +414,11 @@ def run_mcmc(
         "run_key": run_key,
         "target": resolved.spec.manifest,
         "config": config.to_payload(),
+        "acceptance": {
+            "mean": float(np.mean(segment.acceptance_rate)),
+            "minimum": float(np.min(segment.acceptance_rate)),
+            "per_chain": [float(value) for value in per_chain],
+        },
     }
 
 
@@ -428,9 +439,20 @@ def run_mcmc_grid(
     run_label: str,
     recipe: Optional[FamilyRecipe] = None,
     truth_noise_sd: float = 1.0,
+    production_warmup_steps: Optional[int] = None,
+    production_draws: Optional[int] = None,
+    artifact_root: Optional[Any] = None,
+    arm_id: Optional[str] = None,
+    readout_prefixes: Optional[Sequence[int]] = None,
+    readout_artifact_manifest: Optional[Any] = None,
     progress: Optional[Callable[[str], None]] = print,
 ) -> dict[str, Any]:
-    """Pilot, production and all-draw readout on the complete query grid."""
+    """Pilot, production and one or more prefix readouts on the query grid.
+
+    The pilot recipe is never changed by the ablation overrides.  If an
+    artifact destination is supplied, the complete production tensor is
+    atomically committed before the first readout starts.
+    """
 
     started = time.time()
     if recipe is None:
@@ -439,6 +461,80 @@ def run_mcmc_grid(
         except KeyError:
             raise MCMCInferenceError(f"unknown MCMC family {family!r}") from None
     recipe = recipe.validate()
+    loaded_draws = None
+    loaded_artifact = None
+    artifact_load_seconds = 0.0
+    if readout_artifact_manifest is not None:
+        if artifact_root is not None or arm_id is not None:
+            raise MCMCInferenceError(
+                "readout_artifact_manifest cannot be combined with artifact output"
+            )
+        artifact_load_started = time.time()
+        try:
+            loaded_draws, loaded_artifact = load_draw_artifact(
+                readout_artifact_manifest
+            )
+        except MCMCDrawArtifactError as exc:
+            raise MCMCInferenceError(str(exc)) from exc
+        artifact_load_seconds = time.time() - artifact_load_started
+        artifact_provenance = loaded_artifact.get("provenance")
+        if not isinstance(artifact_provenance, Mapping):
+            raise MCMCInferenceError("draw artifact provenance is missing")
+        artifact_config = artifact_provenance.get("production_config")
+        if not isinstance(artifact_config, Mapping):
+            raise MCMCInferenceError("draw artifact production config is missing")
+        if production_warmup_steps is None:
+            production_warmup_steps = artifact_config.get("warmup_steps")
+        if production_draws is None:
+            production_draws = artifact_config.get("segment_size")
+
+    def positive_override(name: str, value: Optional[int], default: int) -> int:
+        if value is None:
+            return int(default)
+        if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+            raise MCMCInferenceError(f"{name} must be a positive integer")
+        result = int(value)
+        if result < 1:
+            raise MCMCInferenceError(f"{name} must be a positive integer")
+        return result
+
+    effective_production = replace(
+        recipe.production,
+        warmup_steps=positive_override(
+            "production_warmup_steps",
+            production_warmup_steps,
+            recipe.production.warmup_steps,
+        ),
+        segment_size=positive_override(
+            "production_draws", production_draws, recipe.production.segment_size
+        ),
+    ).validate()
+    recipe = replace(recipe, production=effective_production).validate()
+    total_draws = int(effective_production.segment_size)
+    if readout_prefixes is None:
+        prefixes = (total_draws,)
+    else:
+        if isinstance(readout_prefixes, (str, bytes)):
+            raise MCMCInferenceError("readout_prefixes must be integer draw counts")
+        normalized = []
+        for value in readout_prefixes:
+            if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+                raise MCMCInferenceError(
+                    "readout_prefixes must contain positive integers"
+                )
+            prefix = int(value)
+            if prefix < 1 or prefix > total_draws:
+                raise MCMCInferenceError(
+                    "readout prefix must lie between 1 and production_draws"
+                )
+            normalized.append(prefix)
+        prefixes = tuple(sorted(set(normalized) | {total_draws}))
+    if readout_artifact_manifest is None and (
+        (artifact_root is None) != (arm_id is None)
+    ):
+        raise MCMCInferenceError(
+            "artifact_root and arm_id must either both be set or both be omitted"
+        )
     grid_x = np.asarray(grid_x_model, np.float32).reshape(-1, 1)
     grid_v_raw = np.asarray(grid_v_raw, np.float32)
     truth = np.asarray(truth_original_units, np.float64).reshape(-1)
@@ -452,43 +548,204 @@ def run_mcmc_grid(
     resolved = resolve_target(model, preprocessor, global_power=1.0)
     if resolved.spec.target_kind != recipe.target_kind:
         raise MCMCInferenceError("family recipe target_kind mismatch")
+
+    if loaded_artifact is not None:
+        provenance = loaded_artifact["provenance"]
+
+        def require_equal(name: str, actual: Any, expected: Any) -> None:
+            if actual != expected:
+                raise MCMCInferenceError(f"draw artifact {name} mismatch")
+
+        require_equal("family", provenance.get("family"), str(family))
+        require_equal(
+            "checkpoint identity",
+            provenance.get("checkpoint_identity"),
+            str(checkpoint_identity),
+        )
+        require_equal("data seed", provenance.get("data_seed"), int(data_seed))
+        require_equal("seeds", provenance.get("seeds"), seeds)
+        require_equal("run label", provenance.get("run_label"), str(run_label))
+        require_equal("recipe", provenance.get("recipe_hash"), recipe.recipe_hash)
+        require_equal(
+            "production config",
+            provenance.get("production_config"),
+            recipe.production.to_payload(),
+        )
+        require_equal(
+            "target",
+            provenance.get("target_hash"),
+            resolved.spec.manifest["target_hash"],
+        )
+        artifact_grid = provenance.get("grid")
+        if not isinstance(artifact_grid, Mapping):
+            raise MCMCInferenceError("draw artifact grid provenance is missing")
+        current_grid = {
+            "num_queries": int(table.num_queries),
+            "num_targets": int(table.num_targets),
+            "truth_label": str(truth_label),
+            "truth_hash": sha256_array(truth),
+            "catalog_hash": table.catalog_hash,
+            "query_hash": table.query_hash,
+            "preprocessor_identity": str(preprocessor.identity),
+        }
+        for name, expected in current_grid.items():
+            require_equal(name, artifact_grid.get(name), expected)
+        readout_context = provenance.get("readout_context")
+        if not isinstance(readout_context, Mapping):
+            raise MCMCInferenceError("draw artifact readout context is missing")
+        current_readout_context = {
+            "outcome_shift": float(outcome_shift),
+            "outcome_scale": float(outcome_scale),
+            "truth_noise_sd": float(truth_noise_sd),
+            "treatment_transform": {
+                "shift": float(treatment_transform["shift"]),
+                "scale": float(treatment_transform["scale"]),
+            },
+        }
+        require_equal("readout context", readout_context, current_readout_context)
+        latent_dim = int(sum(int(value) for value in model.params["z_dims"]))
+        expected_shape = (
+            total_draws,
+            int(recipe.production.num_chains),
+            int(table.num_targets),
+            latent_dim,
+        )
+        require_equal(
+            "draw shape",
+            tuple(int(value) for value in loaded_draws.shape),
+            expected_shape,
+        )
     if progress:
         progress(
             f"[mcmc {family}] {table.num_targets} targets / "
             f"{table.num_queries} full-grid queries"
         )
-    variance, pilot = estimate_pilot_state_variance(
-        model,
-        resolved,
-        table,
-        recipe,
-        run_seed=seeds["pilot"],
-        run_label=run_label,
-        progress=progress,
-    )
-    production = run_mcmc(
-        model,
-        table,
-        preprocessor=preprocessor,
-        run_seed=seeds["production"],
-        run_label=run_label,
-        config=recipe.production,
-        state_variance=variance,
-        progress=progress,
-    )
-    readout_started = time.time()
+    if loaded_artifact is None:
+        variance, pilot = estimate_pilot_state_variance(
+            model,
+            resolved,
+            table,
+            recipe,
+            run_seed=seeds["pilot"],
+            run_label=run_label,
+            progress=progress,
+        )
+        production = run_mcmc(
+            model,
+            table,
+            preprocessor=preprocessor,
+            run_seed=seeds["production"],
+            run_label=run_label,
+            config=recipe.production,
+            state_variance=variance,
+            progress=progress,
+        )
+    else:
+        provenance = loaded_artifact["provenance"]
+        pilot = {
+            "skipped": True,
+            "seconds": 0.0,
+            "reason": "readout_artifact_manifest",
+        }
+        production = {
+            "draws": loaded_draws,
+            "seconds": 0.0,
+            "run_seed": int(seeds["production"]),
+            "run_key": provenance.get("production_run_key"),
+            "target": resolved.spec.manifest,
+            "config": recipe.production.to_payload(),
+            "acceptance": provenance.get("production_acceptance"),
+        }
+        if progress:
+            progress(
+                f"[mcmc {family}] verified draw artifact; skipping pilot and production"
+            )
+
+    artifact = loaded_artifact
+    artifact_seconds = float(artifact_load_seconds)
+    if artifact_root is not None:
+        artifact_started = time.time()
+        artifact_provenance = {
+            "family": str(family),
+            "checkpoint_identity": str(checkpoint_identity),
+            "data_seed": int(data_seed),
+            "seeds": seeds,
+            "run_label": str(run_label),
+            "recipe_hash": recipe.recipe_hash,
+            "production_config": production["config"],
+            "production_run_key": production["run_key"],
+            "production_acceptance": production["acceptance"],
+            "target": production["target"],
+            "target_hash": production["target"]["target_hash"],
+            "grid": {
+                "num_queries": int(table.num_queries),
+                "num_targets": int(table.num_targets),
+                "truth_label": str(truth_label),
+                "truth_hash": sha256_array(truth),
+                "catalog_hash": table.catalog_hash,
+                "query_hash": table.query_hash,
+                "preprocessor_identity": str(preprocessor.identity),
+            },
+            "readout_context": {
+                "outcome_shift": float(outcome_shift),
+                "outcome_scale": float(outcome_scale),
+                "truth_noise_sd": float(truth_noise_sd),
+                "treatment_transform": {
+                    "shift": float(treatment_transform["shift"]),
+                    "scale": float(treatment_transform["scale"]),
+                },
+            },
+        }
+        try:
+            artifact = save_draw_artifact(
+                production["draws"],
+                artifact_root=artifact_root,
+                arm_id=str(arm_id),
+                provenance=artifact_provenance,
+            )
+        except MCMCDrawArtifactError as exc:
+            raise MCMCInferenceError(str(exc)) from exc
+        artifact_seconds = time.time() - artifact_started
+        if progress:
+            progress(
+                f"[mcmc {family}] saved {total_draws} draws/chain to "
+                f"{artifact['artifact_dir']}"
+            )
+
     readout_config = replace(
         recipe.readout, truth_noise_sd=float(truth_noise_sd)
     )
-    readout = FullGridReadout(
+    readout_runner = FullGridReadout(
         model,
         table,
         truth,
         outcome_shift=float(outcome_shift),
         outcome_scale=float(outcome_scale),
         config=readout_config,
-    )(production["draws"])
-    uq_seconds = time.time() - readout_started
+    )
+    prefix_readouts: dict[str, dict[str, Any]] = {}
+    readout_seconds: dict[str, float] = {}
+    for prefix in prefixes:
+        readout_started = time.time()
+        prefix_readout = readout_runner(production["draws"][:prefix])
+        elapsed = time.time() - readout_started
+        prefix_readout["readout_seconds"] = float(elapsed)
+        prefix_readouts[str(prefix)] = prefix_readout
+        readout_seconds[str(prefix)] = float(elapsed)
+        if progress:
+            label = (
+                f"[mcmc {family}]"
+                if prefix == total_draws
+                else f"[mcmc {family} prefix={prefix}]"
+            )
+            progress(
+                f"{label} structural MSE "
+                f"{prefix_readout['structural_mse_plugin']:.6f}; "
+                f"cov95 {prefix_readout['coverage']['0.95']:.6f}; "
+                f"width80 {prefix_readout['width80']:.6f}"
+            )
+    readout = prefix_readouts[str(total_draws)]
+    uq_seconds = readout_seconds[str(total_draws)]
     result = {
         "schema_version": "bgm-mcmc-inference",
         "family": str(family),
@@ -499,6 +756,9 @@ def run_mcmc_grid(
         "data_seed": int(data_seed),
         "seeds": seeds,
         "run_label": str(run_label),
+        "mode": (
+            "artifact-readout" if loaded_artifact is not None else "sample-and-readout"
+        ),
         "grid": {
             "num_queries": int(table.num_queries),
             "num_targets": int(table.num_targets),
@@ -515,9 +775,12 @@ def run_mcmc_grid(
             "run_key": production["run_key"],
             "target": production["target"],
             "target_hash": production["target"]["target_hash"],
+            "acceptance": production["acceptance"],
         },
         "pilot": pilot,
         "readout": readout,
+        "readouts": prefix_readouts,
+        "artifact": artifact,
         "treatment_transform": {
             "shift": float(treatment_transform["shift"]),
             "scale": float(treatment_transform["scale"]),
@@ -526,17 +789,13 @@ def run_mcmc_grid(
         "timings": {
             "pilot_seconds": float(pilot["seconds"]),
             "mcmc_seconds": float(production["seconds"]),
+            "artifact_seconds": float(artifact_seconds),
             "uq_seconds": float(uq_seconds),
+            "readout_seconds_by_prefix": readout_seconds,
+            "readout_total_seconds": float(sum(readout_seconds.values())),
             "total_seconds": float(time.time() - started),
         },
     }
-    if progress:
-        progress(
-            f"[mcmc {family}] structural MSE "
-            f"{readout['structural_mse_plugin']:.6f}; "
-            f"cov95 {readout['coverage']['0.95']:.6f}; "
-            f"width80 {readout['width80']:.6f}"
-        )
     return result
 
 

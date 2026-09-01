@@ -218,6 +218,70 @@ def _build_arg_parser():
         ),
     )
     parser.add_argument(
+        "--mcmc-production-warmup-steps",
+        dest="mcmc_production_warmup_steps",
+        type=int,
+        default=None,
+        metavar="N",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--mcmc-production-draws",
+        dest="mcmc_production_draws",
+        type=int,
+        default=None,
+        metavar="N",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--mcmc-artifact-root",
+        dest="mcmc_artifact_root",
+        type=str,
+        default=None,
+        metavar="DIR",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--mcmc-arm-id",
+        dest="mcmc_arm_id",
+        type=str,
+        default=None,
+        metavar="ID",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--mcmc-readout-prefixes",
+        dest="mcmc_readout_prefixes",
+        type=str,
+        default=None,
+        metavar="N[,N...]",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--mcmc-readout-artifact",
+        dest="mcmc_readout_artifact",
+        type=str,
+        default=None,
+        metavar="MANIFEST",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--mcmc-reference-map-mse",
+        dest="mcmc_reference_map_mse",
+        type=float,
+        default=None,
+        metavar="FLOAT",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--mcmc-reference-encoder-mse",
+        dest="mcmc_reference_encoder_mse",
+        type=float,
+        default=None,
+        metavar="FLOAT",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
         "--set",
         dest="overrides",
         action="append",
@@ -229,6 +293,125 @@ def _build_arg_parser():
         ),
     )
     return parser
+
+
+_MCMC_INFERENCE_OPTIONS_KEY = "_mcmc_inference_options"
+
+
+def _parse_mcmc_readout_prefixes(value):
+    """Normalize the private ablation CLI's comma-separated draw prefixes."""
+    if value is None:
+        return None
+    pieces = [piece.strip() for piece in str(value).split(",")]
+    if not pieces or any(not piece for piece in pieces):
+        raise ValueError("--mcmc-readout-prefixes requires comma-separated integers")
+    try:
+        prefixes = sorted({int(piece) for piece in pieces})
+    except ValueError as exc:
+        raise ValueError(
+            "--mcmc-readout-prefixes requires comma-separated integers"
+        ) from exc
+    if any(prefix <= 0 for prefix in prefixes):
+        raise ValueError("--mcmc-readout-prefixes values must be positive")
+    return prefixes
+
+
+def _apply_mcmc_inference_cli(params, args):
+    """Validate and attach inference-only MCMC ablation options.
+
+    The options live under one underscore-prefixed key, so they are excluded
+    from the model-training manifest and cannot change checkpoint identity.
+    """
+    raw = {
+        "production_warmup_steps": args.mcmc_production_warmup_steps,
+        "production_draws": args.mcmc_production_draws,
+        "artifact_root": args.mcmc_artifact_root,
+        "arm_id": args.mcmc_arm_id,
+        "readout_prefixes": args.mcmc_readout_prefixes,
+        "readout_artifact_manifest": args.mcmc_readout_artifact,
+        "reference_map_mse": args.mcmc_reference_map_mse,
+        "reference_encoder_mse": args.mcmc_reference_encoder_mse,
+    }
+    if all(value is None for value in raw.values()):
+        return params
+    if _mcmc_only_timestamp(params) is None:
+        raise ValueError("MCMC ablation options require --mcmc-only TIMESTAMP")
+
+    warmup = raw["production_warmup_steps"]
+    draws = raw["production_draws"]
+    if (warmup is None) != (draws is None):
+        raise ValueError(
+            "--mcmc-production-warmup-steps and --mcmc-production-draws "
+            "must be provided together"
+        )
+    if warmup is not None and int(warmup) <= 0:
+        raise ValueError("--mcmc-production-warmup-steps must be positive")
+    if draws is not None and int(draws) <= 0:
+        raise ValueError("--mcmc-production-draws must be positive")
+
+    artifact_root = raw["artifact_root"]
+    arm_id = raw["arm_id"]
+    if (artifact_root is None) != (arm_id is None):
+        raise ValueError(
+            "--mcmc-artifact-root and --mcmc-arm-id must be provided together"
+        )
+    if artifact_root is not None and not str(artifact_root).strip():
+        raise ValueError("--mcmc-artifact-root must be non-empty")
+    if arm_id is not None:
+        arm_id = str(arm_id).strip()
+        if not arm_id:
+            raise ValueError("--mcmc-arm-id must be non-empty")
+        allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-"
+        if any(character not in allowed for character in arm_id):
+            raise ValueError(
+                "--mcmc-arm-id may contain only letters, digits, '.', '_' and '-'"
+            )
+
+    prefixes = _parse_mcmc_readout_prefixes(raw["readout_prefixes"])
+    readout_artifact = raw["readout_artifact_manifest"]
+    if readout_artifact is not None:
+        readout_artifact = str(readout_artifact).strip()
+        if not readout_artifact:
+            raise ValueError("--mcmc-readout-artifact must be non-empty")
+        if warmup is not None or artifact_root is not None:
+            raise ValueError(
+                "--mcmc-readout-artifact cannot be combined with production "
+                "warmup/draws or artifact root/arm options"
+            )
+    if prefixes is not None:
+        if draws is None and readout_artifact is None:
+            raise ValueError(
+                "--mcmc-readout-prefixes requires production draws or "
+                "--mcmc-readout-artifact"
+            )
+        if draws is not None and prefixes[-1] > int(draws):
+            raise ValueError(
+                "--mcmc-readout-prefixes cannot exceed --mcmc-production-draws"
+            )
+
+    reference_metrics = {}
+    for name, value in (
+        ("map", raw["reference_map_mse"]),
+        ("encoder", raw["reference_encoder_mse"]),
+    ):
+        if value is not None:
+            value = float(value)
+            if not np.isfinite(value) or value < 0.0:
+                raise ValueError(
+                    f"--mcmc-reference-{name}-mse must be finite and non-negative"
+                )
+            reference_metrics[name] = value
+
+    params[_MCMC_INFERENCE_OPTIONS_KEY] = {
+        "production_warmup_steps": None if warmup is None else int(warmup),
+        "production_draws": None if draws is None else int(draws),
+        "artifact_root": None if artifact_root is None else str(artifact_root).strip(),
+        "arm_id": arm_id,
+        "readout_prefixes": prefixes,
+        "readout_artifact_manifest": readout_artifact,
+        "reference_metrics": reference_metrics,
+    }
+    return params
 
 
 def _apply_config_overrides(params, overrides):
@@ -2387,6 +2570,7 @@ def _run_structural_mcmc(
     y_shift, y_scale = _standardizer_scalars(y_stats)
     x_shift, x_scale = _standardizer_scalars(x_stats)
     repeat_id = int(params.get("repeat_id", 0))
+    inference_options = params.get(_MCMC_INFERENCE_OPTIONS_KEY) or {}
     record = run_mcmc_grid(
         model,
         family=family,
@@ -2401,7 +2585,18 @@ def _run_structural_mcmc(
         data_seed=int(params.get("run_seed", params.get("seed", 0))),
         checkpoint_identity=_checkpoint_identity(model),
         run_label=f"{params['dataset']}|repeat{repeat_id}|{model.timestamp}|{family}",
+        production_warmup_steps=inference_options.get("production_warmup_steps"),
+        production_draws=inference_options.get("production_draws"),
+        artifact_root=inference_options.get("artifact_root"),
+        arm_id=inference_options.get("arm_id"),
+        readout_prefixes=inference_options.get("readout_prefixes"),
+        readout_artifact_manifest=inference_options.get(
+            "readout_artifact_manifest"
+        ),
     )
+    reference_metrics = inference_options.get("reference_metrics") or {}
+    if reference_metrics:
+        record["reference_metrics"] = dict(reference_metrics)
     return record
 
 
@@ -3357,6 +3552,7 @@ def main():
         if args.repeat_id is None:
             raise ValueError("--mcmc-only requires --repeat-id.")
         params[_MCMC_ONLY_TIMESTAMP_KEY] = mcmc_only_timestamp
+    _apply_mcmc_inference_cli(params, args)
     _apply_demand_design_benchmark_defaults(params)
     _validate_map_only_structural_config(params)
     _validate_egm_multistart_run_shape(params)

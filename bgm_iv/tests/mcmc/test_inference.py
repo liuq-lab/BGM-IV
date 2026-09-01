@@ -194,3 +194,155 @@ def test_misaligned_grid_is_rejected():
             run_label="bad",
             recipe=_smoke_recipe("demand"),
         )
+
+
+@pytest.mark.slow
+def test_ablation_overrides_save_before_prefix_readouts(tmp_path):
+    family = "demand"
+    model, grid_x, grid_v, truth = _model_and_grid(family)
+    result = run_mcmc_grid(
+        model,
+        family=family,
+        grid_x_model=grid_x,
+        grid_v_raw=grid_v,
+        preprocessor=AffinePreprocessorSpec.identity_map(grid_v.shape[1]),
+        truth_original_units=truth,
+        truth_label="tiny-prefix-grid",
+        outcome_shift=0.0,
+        outcome_scale=1.0,
+        treatment_transform={"shift": 0.0, "scale": 1.0},
+        data_seed=0,
+        checkpoint_identity="tiny-prefix",
+        run_label="tiny-prefix",
+        recipe=_smoke_recipe(family),
+        production_warmup_steps=3,
+        production_draws=5,
+        artifact_root=tmp_path,
+        arm_id="w3-d5",
+        readout_prefixes=[3, 4, 5],
+        progress=None,
+    )
+
+    assert result["recipe"]["production"]["warmup_steps"] == 3
+    assert result["recipe"]["production"]["segment_size"] == 5
+    assert set(result["readouts"]) == {"3", "4", "5"}
+    assert result["readout"] is result["readouts"]["5"]
+    assert result["readouts"]["3"]["draws_per_chain"] == 3
+    assert result["readouts"]["4"]["draws_per_chain"] == 4
+    assert result["artifact"]["draw_shape"][0] == 5
+    np.testing.assert_array_equal(
+        np.load(result["artifact"]["draws_path"], allow_pickle=False).shape,
+        (5, 4, 2, 4),
+    )
+    assert result["sampler"]["acceptance"]["per_chain"]
+
+
+@pytest.mark.slow
+def test_artifact_readout_skips_sampling_and_revalidates_context(
+    tmp_path, monkeypatch
+):
+    family = "demand"
+    model, grid_x, grid_v, truth = _model_and_grid(family)
+    common = {
+        "family": family,
+        "grid_x_model": grid_x,
+        "grid_v_raw": grid_v,
+        "preprocessor": AffinePreprocessorSpec.identity_map(grid_v.shape[1]),
+        "truth_original_units": truth,
+        "truth_label": "tiny-artifact-grid",
+        "outcome_shift": 0.0,
+        "outcome_scale": 1.0,
+        "treatment_transform": {"shift": 0.0, "scale": 1.0},
+        "data_seed": 0,
+        "checkpoint_identity": "tiny-artifact",
+        "run_label": "tiny-artifact",
+        "recipe": _smoke_recipe(family),
+        "production_warmup_steps": 3,
+        "production_draws": 5,
+        "progress": None,
+    }
+    sampled = run_mcmc_grid(
+        model,
+        **common,
+        artifact_root=tmp_path,
+        arm_id="w3-d5-readout",
+        readout_prefixes=[3, 5],
+    )
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("sampling must not run in artifact readout mode")
+
+    monkeypatch.setattr(
+        "bgm_iv.mcmc.inference.estimate_pilot_state_variance", forbidden
+    )
+    monkeypatch.setattr("bgm_iv.mcmc.inference.run_mcmc", forbidden)
+    restored_common = {
+        key: value
+        for key, value in common.items()
+        if key not in {"production_warmup_steps", "production_draws"}
+    }
+    restored = run_mcmc_grid(
+        model,
+        **restored_common,
+        readout_artifact_manifest=sampled["artifact"]["manifest_path"],
+        readout_prefixes=[3, 4, 5],
+    )
+
+    assert restored["mode"] == "artifact-readout"
+    assert restored["pilot"]["skipped"] is True
+    assert restored["timings"]["pilot_seconds"] == 0.0
+    assert restored["timings"]["mcmc_seconds"] == 0.0
+    assert set(restored["readouts"]) == {"3", "4", "5"}
+    assert restored["readout"]["structural_mse_plugin"] == pytest.approx(
+        sampled["readout"]["structural_mse_plugin"], abs=0.0
+    )
+
+    with pytest.raises(MCMCInferenceError, match="checkpoint identity mismatch"):
+        run_mcmc_grid(
+            model,
+            **{**restored_common, "checkpoint_identity": "wrong-checkpoint"},
+            readout_artifact_manifest=sampled["artifact"]["manifest_path"],
+            readout_prefixes=[5],
+        )
+
+    changed_truth = truth.copy()
+    changed_truth[0] += 1.0
+    with pytest.raises(MCMCInferenceError, match="truth_hash mismatch"):
+        run_mcmc_grid(
+            model,
+            **{**restored_common, "truth_original_units": changed_truth},
+            readout_artifact_manifest=sampled["artifact"]["manifest_path"],
+            readout_prefixes=[5],
+        )
+
+
+@pytest.mark.parametrize(
+    "kwargs,message",
+    [
+        ({"production_warmup_steps": 0}, "positive integer"),
+        ({"production_draws": True}, "positive integer"),
+        ({"production_draws": 5, "readout_prefixes": [6]}, "between"),
+        ({"artifact_root": "somewhere"}, "both be set"),
+    ],
+)
+def test_ablation_arguments_fail_before_sampling(kwargs, message):
+    model, grid_x, grid_v, truth = _model_and_grid("demand")
+    with pytest.raises(MCMCInferenceError, match=message):
+        run_mcmc_grid(
+            model,
+            family="demand",
+            grid_x_model=grid_x,
+            grid_v_raw=grid_v,
+            preprocessor=AffinePreprocessorSpec.identity_map(2),
+            truth_original_units=truth,
+            truth_label="bad-ablation",
+            outcome_shift=0.0,
+            outcome_scale=1.0,
+            treatment_transform={"shift": 0.0, "scale": 1.0},
+            data_seed=0,
+            checkpoint_identity="bad-ablation",
+            run_label="bad-ablation",
+            recipe=_smoke_recipe("demand"),
+            progress=None,
+            **kwargs,
+        )
