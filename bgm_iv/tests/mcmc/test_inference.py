@@ -54,7 +54,7 @@ def _params(family):
     }
     if family == "demand":
         common["v_dim"] = 2
-    elif family in {"vector", "mnist_feature"}:
+    elif family == "vector":
         common.update(v_dim=5, vector_dim=4, sigma_vector_softfloor=0.1)
     else:
         common["v_dim"] = 785
@@ -66,7 +66,7 @@ def _model_and_grid(family):
     if family == "demand":
         model = BGM_IV(params, timestamp=family, random_seed=7)
         unique = np.array([[0.0, 1.0], [0.5, 2.0]], np.float32)
-    elif family in {"vector", "mnist_feature"}:
+    elif family == "vector":
         model = BGM_IV_Vector(params, timestamp=family, random_seed=7)
         unique = np.array(
             [[0.0, 0.1, -0.2, 0.3, -0.4], [0.5, -0.4, 0.3, -0.2, 0.1]],
@@ -112,7 +112,6 @@ def test_family_recipes_pin_requested_production_settings():
     assert set(FAMILY_RECIPES) == {
         "demand",
         "vector",
-        "mnist_feature",
         "mnist_pixel",
     }
     assert FAMILY_RECIPES["demand"].production.segment_size == 12000
@@ -120,7 +119,6 @@ def test_family_recipes_pin_requested_production_settings():
     assert FAMILY_RECIPES["vector"].production.segment_size == 24000
     assert tuple(FAMILY_RECIPES["vector"].production.trajectory_support) == (7, 15, 31)
     assert tuple(FAMILY_RECIPES["mnist_pixel"].production.trajectory_support) == (7, 15, 31)
-    assert tuple(FAMILY_RECIPES["mnist_feature"].production.trajectory_support) == (7, 15)
     assert FAMILY_RECIPES["mnist_pixel"].target_kind == "generalized_gibbs"
     assert all(
         recipe.readout.to_payload()["scoring_unit"] == "query"
@@ -143,7 +141,7 @@ def test_seeds_are_content_derived_and_stage_distinct():
 
 
 @pytest.mark.slow
-@pytest.mark.parametrize("family", ["demand", "vector", "mnist_feature", "mnist_pixel"])
+@pytest.mark.parametrize("family", ["demand", "vector", "mnist_pixel"])
 def test_all_families_run_one_full_grid_target_set(family, capsys):
     model, grid_x, grid_v, truth = _model_and_grid(family)
     result = run_mcmc_grid(

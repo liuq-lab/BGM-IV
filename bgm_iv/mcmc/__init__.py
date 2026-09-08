@@ -14,9 +14,7 @@ _SUBMODULES = ("target", "sampler", "readout", "inference")
 _EXPORTS = {
     "AffinePreprocessorSpec": "target",
     "EvidenceBlockSpec": "target",
-    "FeaturePreprocessorSpec": "target",
     "ModelTrainingProvenance": "target",
-    "PCAFeaturePreprocessorSpec": "target",
     "ResolvedTarget": "target",
     "TargetSpec": "target",
     "independent_formula_oracle": "target",

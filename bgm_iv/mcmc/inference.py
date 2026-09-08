@@ -160,15 +160,6 @@ FAMILY_RECIPES: dict[str, FamilyRecipe] = {
         target_kind="model_posterior",
         production=_VECTOR_PRODUCTION,
     ),
-    "mnist_feature": FamilyRecipe(
-        name="mnist_feature",
-        target_kind="model_posterior",
-        production=replace(
-            _VECTOR_PRODUCTION,
-            num_leapfrog_steps=15,
-            trajectory_support=(7, 15),
-        ),
-    ),
     "mnist_pixel": FamilyRecipe(
         name="mnist_pixel",
         target_kind="generalized_gibbs",

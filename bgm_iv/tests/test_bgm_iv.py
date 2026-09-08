@@ -263,23 +263,6 @@ def test_structural_methods_reject_unknown_methods_and_require_map():
         )
 
 
-def test_feature_dataset_defaults_derive_dimensions_from_pixel_v_dim():
-    params = {"dataset": "Sim_Demand_Design_Mnist_Feature_IV"}
-    main_module._apply_demand_design_benchmark_defaults(params)
-    assert params["pixel_v_dim"] == 785 and params["feature_map"] == "egm"
-    assert params["vector_dim"] == 64 and params["v_dim"] == 65
-    assert params["image_seed"] == 42 and params["holdout_seed_offset"] == 1000
-    hd = {"dataset": "Sim_Demand_Design_Mnist_Feature_IV", "pixel_v_dim": 1000}
-    main_module._apply_demand_design_benchmark_defaults(hd)
-    assert hd["vector_dim"] == 279 and hd["v_dim"] == 280
-    bad = {"dataset": "Sim_Demand_Design_Mnist_Feature_IV", "v_dim": 785}
-    with pytest.raises(ValueError, match="derived"):
-        main_module._apply_demand_design_benchmark_defaults(bad)
-    bad_map = {"dataset": "Sim_Demand_Design_Mnist_Feature_IV", "feature_map": "raw"}
-    with pytest.raises(ValueError, match="feature_map"):
-        main_module._apply_demand_design_benchmark_defaults(bad_map)
-
-
 def test_training_grid_monitor_switch_controls_the_callback():
     params = {"structural_methods": ["map"], "training_grid_monitor": False}
     assert main_module._maybe_structural_monitor_callback(
@@ -518,7 +501,6 @@ def test_all_public_demand_design_yamls_expose_the_mcmc_budget():
         "Sim_Demand_Design_IV.yaml",
         "Sim_Demand_Design_Vector_IV.yaml",
         "Sim_Demand_Design_Mnist_IV.yaml",
-        "Sim_Demand_Design_Mnist_Feature_IV.yaml",
     )
     root = Path(main_module.__file__).resolve().parent / "configs"
     for name in config_names:
@@ -1822,7 +1804,7 @@ def test_training_manifest_binds_checkpoint_params_and_data(tmp_path):
         main_module._restore_demand_design_model({**params, "lr": 1e-3}, model.timestamp, train=train)
     with pytest.raises(RuntimeError, match="extra"):
         main_module._restore_demand_design_model(
-            params, model.timestamp, train=train, manifest_extra={"pixel_stage": {"timestamp": "x"}}
+            params, model.timestamp, train=train, manifest_extra={"binding": {"timestamp": "x"}}
         )
     path.unlink()
     with pytest.raises(FileNotFoundError, match="manifest"):

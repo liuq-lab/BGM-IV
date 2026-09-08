@@ -209,8 +209,7 @@ internet access, provide the cache file before running the MNIST config.
 ```text
 bgm_iv/
   datasets/        # demand, MNIST, and vector-proxy simulators
-  features/        # image-representation export and preprocessing
-  hashing.py       # SHA-256 digests shared by features/ and mcmc/
+  hashing.py       # SHA-256 digests shared by main.py and mcmc/
   models/          # BGM-IV model implementations
   mcmc/            # full-grid inference (target, sampler, readout, inference)
   utils/           # data I/O helpers
@@ -240,7 +239,7 @@ MCMC calibration columns are `mcmc_cov50`, `mcmc_cov80`, `mcmc_cov95`,
 `mcmc_width50`, `mcmc_width80`, and `mcmc_width95`.
 
 The all-draw Gaussian-mixture readout is expected to add roughly 20--40 minutes
-per Pixel/Vector/MNIST-Feature repeat and 10--25 minutes per Demand repeat.
+per Pixel/Vector repeat and 10--25 minutes per Demand repeat.
 These are planning estimates; cluster wall time and peak memory must be
 measured on the user's Yale jobs.
 
