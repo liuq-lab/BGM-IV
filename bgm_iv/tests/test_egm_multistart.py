@@ -6,22 +6,21 @@ import pytest
 from bgm_iv.egm_multistart import (
     CandidateSelectionError,
     EGM_CANDIDATE_MANIFEST_VERSION,
+    EGM_CRITERION_SEED_NAMESPACE,
     EGM_INIT_SEED_NAMESPACE,
     EGM_SCHEDULE_SEED_NAMESPACE,
     EGM_SCORE_WINDOW_SIZE,
+    EGM_SELECTION_CRITERION,
     EGM_SELECTION_MANIFEST_VERSION,
-    EGM_SELECTOR_DRAW_NAMESPACE,
-    EGM_SELECTOR_TEMPERATURE,
     EGM_SELECTOR_VERSION,
     MultistartConfigurationError,
+    POST_EGM_SEED_NAMESPACE,
     derive_multistart_seed,
     derive_multistart_seeds,
     make_candidate_manifest,
     rank_finite_candidates,
-    relative_loss_softmax,
     score_evaluation_iterations,
-    select_egm_candidate,
-    selector_uniform_draw,
+    select_candidate_by_criterion,
     validate_multistart_config,
     verify_manifest_hash,
 )
@@ -30,7 +29,6 @@ from bgm_iv.egm_multistart import (
 def _multistart_params(**overrides):
     params = {
         "egm_num_warm_starts": 10,
-        "egm_selection_top_k": 3,
         "save_model": True,
         "deterministic_training": True,
         "training_grid_monitor": False,
@@ -42,10 +40,10 @@ def _multistart_params(**overrides):
 def test_config_defaults_preserve_single_start():
     normalized = validate_multistart_config({})
     assert normalized["egm_num_warm_starts"] == 1
-    assert normalized["egm_selection_top_k"] == 1
+    assert "egm_selection_top_k" not in normalized
 
 
-def test_config_accepts_ms10_top3_without_mutating_input():
+def test_config_accepts_ten_starts_without_mutating_input():
     params = _multistart_params()
     normalized = validate_multistart_config(params)
     assert normalized == params
@@ -56,7 +54,8 @@ def test_config_accepts_ms10_top3_without_mutating_input():
     "overrides, message",
     [
         ({"egm_num_warm_starts": 0}, "egm_num_warm_starts"),
-        ({"egm_selection_top_k": 11}, "egm_selection_top_k"),
+        ({"egm_selection_top_k": 3}, "egm_selection_top_k"),
+        ({"egm_selection_top_k": 1}, "no longer supported"),
         ({"save_model": False}, "save_model"),
         ({"deterministic_training": False}, "deterministic_training"),
         ({"training_grid_monitor": True}, "training_grid_monitor"),
@@ -72,7 +71,6 @@ def test_config_keeps_multistart_identity_for_mcmc_only_restore():
         _multistart_params(), mcmc_only=True
     )
     assert normalized["egm_num_warm_starts"] == 10
-    assert normalized["egm_selection_top_k"] == 3
 
 
 def test_score_window_is_last_ten_fixed_evaluation_events():
@@ -99,18 +97,47 @@ def test_seed_derivation_is_reproducible_and_namespaced():
     )
     assert len(seeds["init_seeds"]) == 10
     assert len(set(seeds["init_seeds"])) == 10
+    assert len(seeds["criterion_seeds"]) == 10
     assert all(0 < seed < 2**31 - 1 for seed in seeds["init_seeds"])
+    assert all(0 < seed < 2**31 - 1 for seed in seeds["criterion_seeds"])
     assert len(
         {
             *seeds["init_seeds"],
+            *seeds["criterion_seeds"],
             seeds["schedule_seed"],
-            seeds["selector_seed"],
             seeds["post_egm_seed"],
         }
-    ) == 13
+    ) == 22
     assert seeds != derive_multistart_seeds(
         "vector", 5_000, 0.5, 8, 10, run_seed=108
     )
+
+
+def test_seed_derivation_keeps_historical_streams_and_adds_criterion_seeds():
+    # The init / schedule / post-EGM streams are the same functions of the cell
+    # identity as before the selection rule changed, so candidate trajectories
+    # remain comparable with earlier campaigns; only the criterion stream is new.
+    common = ("vector", 5_000, 0.5, 7)
+    seeds = derive_multistart_seeds(*common, 3, run_seed=107)
+    assert seeds["init_seeds"] == [
+        derive_multistart_seed(
+            *common, EGM_INIT_SEED_NAMESPACE, run_seed=107, candidate_id=index
+        )
+        for index in range(3)
+    ]
+    assert seeds["schedule_seed"] == derive_multistart_seed(
+        *common, EGM_SCHEDULE_SEED_NAMESPACE, run_seed=107
+    )
+    assert seeds["post_egm_seed"] == derive_multistart_seed(
+        *common, POST_EGM_SEED_NAMESPACE, run_seed=107
+    )
+    assert seeds["criterion_seeds"] == [
+        derive_multistart_seed(
+            *common, EGM_CRITERION_SEED_NAMESPACE, run_seed=107, candidate_id=index
+        )
+        for index in range(3)
+    ]
+    assert "selector_seed" not in seeds
 
 
 def test_seed_derivation_changes_every_stream_with_master_run_seed():
@@ -122,39 +149,43 @@ def test_seed_derivation_changes_every_stream_with_master_run_seed():
     )
     assert first["init_seeds"] != second["init_seeds"]
     assert first["schedule_seed"] != second["schedule_seed"]
-    assert first["selector_seed"] != second["selector_seed"]
     assert first["post_egm_seed"] != second["post_egm_seed"]
+    assert first["criterion_seeds"] != second["criterion_seeds"]
 
 
 def test_multistart_contract_names_are_versionless():
-    assert EGM_SELECTOR_VERSION == "relative-loss-softmax"
+    assert EGM_SELECTOR_VERSION == "train-iv-map-post-bgm"
+    assert EGM_SELECTION_CRITERION == "train_iv_map"
     assert EGM_CANDIDATE_MANIFEST_VERSION == "egm-candidate-manifest"
     assert EGM_SELECTION_MANIFEST_VERSION == "egm-selection-manifest"
     assert EGM_INIT_SEED_NAMESPACE == "egm-init"
     assert EGM_SCHEDULE_SEED_NAMESPACE == "egm-schedule"
-    assert EGM_SELECTOR_DRAW_NAMESPACE == "selector-draw"
+    assert POST_EGM_SEED_NAMESPACE == "post-egm"
+    assert EGM_CRITERION_SEED_NAMESPACE == "egm-criterion"
 
 
-def test_init_seed_requires_candidate_and_other_streams_forbid_it():
-    with pytest.raises(ValueError, match="candidate_id is required"):
-        derive_multistart_seed(
-            "vector",
-            5_000,
-            0.5,
-            0,
-            EGM_INIT_SEED_NAMESPACE,
-            run_seed=0,
-        )
-    with pytest.raises(ValueError, match="only valid"):
-        derive_multistart_seed(
-            "vector",
-            5_000,
-            0.5,
-            0,
-            EGM_SCHEDULE_SEED_NAMESPACE,
-            run_seed=0,
-            candidate_id=0,
-        )
+def test_per_candidate_seeds_require_candidate_and_shared_streams_forbid_it():
+    for namespace in (EGM_INIT_SEED_NAMESPACE, EGM_CRITERION_SEED_NAMESPACE):
+        with pytest.raises(ValueError, match="candidate_id is required"):
+            derive_multistart_seed(
+                "vector",
+                5_000,
+                0.5,
+                0,
+                namespace,
+                run_seed=0,
+            )
+    for namespace in (EGM_SCHEDULE_SEED_NAMESPACE, POST_EGM_SEED_NAMESPACE):
+        with pytest.raises(ValueError, match="only valid"):
+            derive_multistart_seed(
+                "vector",
+                5_000,
+                0.5,
+                0,
+                namespace,
+                run_seed=0,
+                candidate_id=0,
+            )
 
 
 def test_ranking_is_stable_and_excludes_nonfinite_scores():
@@ -173,45 +204,35 @@ def test_ranking_fails_closed_when_top_k_finite_candidates_are_unavailable():
         )
 
 
-def test_relative_loss_softmax_matches_documented_example():
-    probabilities = relative_loss_softmax([0.040, 0.041, 0.044])
-    assert EGM_SELECTOR_TEMPERATURE == 0.05
-    assert sum(probabilities) == pytest.approx(1.0)
-    assert probabilities == pytest.approx(
-        (0.57409699, 0.34820743, 0.07769558), rel=1e-6
-    )
-
-
-def test_relative_loss_softmax_is_nearly_uniform_for_near_ties():
-    probabilities = relative_loss_softmax([0.0400, 0.0402, 0.0404])
-    assert probabilities == pytest.approx(
-        (0.3671654, 0.3322250, 0.3006096), rel=1e-5
-    )
-
-
-def test_selector_is_reproducible_and_records_inverse_cdf_draw():
-    scores = {
-        0: 0.040,
-        1: 0.041,
-        2: 0.044,
-        3: 0.20,
-        4: math.nan,
+def test_selection_is_argmin_of_post_bgm_training_criterion():
+    criteria = {
+        0: 190.0,
+        1: 161.6,
+        2: 175.0,
+        3: math.nan,
+        4: 161.6,
     }
-    first = select_egm_candidate(scores, top_k=3, selector_seed=1234)
-    second = select_egm_candidate(scores, top_k=3, selector_seed=1234)
+    egm_scores = {0: 0.040, 1: 0.044, 2: 0.041, 3: 0.039, 4: 0.045}
+    first = select_candidate_by_criterion(criteria, egm_tail_scores=egm_scores)
+    second = select_candidate_by_criterion(criteria, egm_tail_scores=egm_scores)
     assert first == second
-    assert first["uniform_draw"] == selector_uniform_draw(1234)
-    assert first["selected_candidate_id"] in {0, 1, 2}
-    selected = next(
-        record
-        for record in first["top_k_candidates"]
-        if record["candidate_id"] == first["selected_candidate_id"]
-    )
-    lower = 0.0 if selected["rank"] == 1 else first["top_k_candidates"][
-        selected["rank"] - 2
-    ]["cdf_upper"]
-    assert lower <= first["uniform_draw"] < selected["cdf_upper"]
-    assert first["selected_probability"] == selected["probability"]
+    # Deterministic argmin with a candidate-id tie break; the EGM score does
+    # not enter (candidate 3 has the best EGM score but a NaN criterion).
+    assert first["selected_candidate_id"] == 1
+    assert first["selected_rank"] == 1
+    assert first["selected_criterion"] == pytest.approx(161.6)
+    assert first["selection_criterion"] == EGM_SELECTION_CRITERION
+    assert first["selector_version"] == EGM_SELECTOR_VERSION
+    assert [record["candidate_id"] for record in first["finite_ranking"]] == [
+        1, 4, 2, 0
+    ]
+    assert [record["finite"] for record in first["candidate_criteria"]] == [
+        True, True, True, False, True
+    ]
+    assert first["selected_egm_tail_rank"] == 4
+    assert [record["candidate_id"] for record in first["egm_tail_ranking"]] == [
+        3, 0, 2, 1, 4
+    ]
     assert not first["uses_validation"]
     assert not first["uses_holdout"]
     assert not first["uses_test_grid"]
@@ -223,12 +244,20 @@ def test_selector_is_reproducible_and_records_inverse_cdf_draw():
     json.dumps(first, allow_nan=False)
 
 
-def test_selector_hash_detects_tampering():
-    payload = select_egm_candidate(
-        {0: 0.04, 1: 0.041, 2: 0.044},
-        top_k=3,
-        selector_seed=99,
-    )
+def test_selection_works_without_egm_diagnostics_and_fails_closed():
+    payload = select_candidate_by_criterion({0: 0.5, 1: 0.25})
+    assert payload["selected_candidate_id"] == 1
+    assert payload["egm_tail_scores"] == []
+    assert payload["egm_tail_ranking"] == []
+    assert payload["selected_egm_tail_rank"] is None
+    with pytest.raises(CandidateSelectionError, match="at least 1"):
+        select_candidate_by_criterion({0: math.nan, 1: None, 2: math.inf})
+    with pytest.raises(ValueError, match="exactly the candidates"):
+        select_candidate_by_criterion({0: 0.5, 1: 0.25}, egm_tail_scores={0: 0.1})
+
+
+def test_selection_hash_detects_tampering():
+    payload = select_candidate_by_criterion({0: 0.04, 1: 0.041, 2: 0.044})
     payload["selected_candidate_id"] = 9
     assert not verify_manifest_hash(
         payload,
@@ -259,6 +288,16 @@ def test_candidate_manifest_is_json_safe_self_hashed_and_uses_tail_mean():
         worker_pid=1234,
         device_names=["/device:GPU:0"],
         device_hash="f" * 64,
+        bgm_checkpoint_path="candidate_02/bgm-final/ckpt-1",
+        bgm_checkpoint_hash="1" * 64,
+        bgm_checkpoint_weight_hash="2" * 64,
+        criterion_seed=77,
+        train_iv_map=161.6,
+        train_iv_encoder=154.4,
+        train_mse_x=0.05,
+        train_mse_y=0.02,
+        train_mse_v=0.01,
+        bgm_seconds=811.5,
     )
     assert payload["tail_mean_score"] == pytest.approx(sum(scores) / 10)
     assert payload["run_seed"] == 10
@@ -266,6 +305,11 @@ def test_candidate_manifest_is_json_safe_self_hashed_and_uses_tail_mean():
     assert payload["device_names"] == ["/device:GPU:0"]
     assert payload["device_hash"] == "f" * 64
     assert payload["checkpoint_weight_hash"] == "e" * 64
+    assert payload["bgm_checkpoint_weight_hash"] == "2" * 64
+    assert payload["criterion_seed"] == 77
+    assert payload["train_iv_map"] == pytest.approx(161.6)
+    assert payload["train_iv_encoder"] == pytest.approx(154.4)
+    assert payload["bgm_seconds"] == pytest.approx(811.5)
     assert verify_manifest_hash(
         payload,
         hash_field="candidate_manifest_hash",
@@ -274,7 +318,7 @@ def test_candidate_manifest_is_json_safe_self_hashed_and_uses_tail_mean():
     json.dumps(payload, allow_nan=False)
 
 
-def test_candidate_manifest_serializes_nonfinite_loss_as_null():
+def test_candidate_manifest_serializes_nonfinite_values_as_null():
     scores = [0.04] * 9 + [math.nan]
     payload = make_candidate_manifest(
         candidate_id=2,
@@ -288,7 +332,10 @@ def test_candidate_manifest_serializes_nonfinite_loss_as_null():
         data_hash="d" * 64,
         config_hash="c" * 64,
         code_commit="a" * 40,
+        train_iv_map=math.inf,
     )
     assert payload["full_train_l2_loss_y"][-1] is None
     assert payload["tail_mean_score"] is None
+    assert payload["train_iv_map"] is None
+    assert payload["bgm_checkpoint_path"] is None
     json.dumps(payload, allow_nan=False)

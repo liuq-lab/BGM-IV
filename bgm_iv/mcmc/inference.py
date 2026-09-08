@@ -55,8 +55,8 @@ class MCMCConfig:
 
     def validate(self) -> "MCMCConfig":
         support = tuple(int(value) for value in self.trajectory_support)
-        if int(self.num_chains) != 4:
-            raise MCMCInferenceError("production recipes require exactly four chains")
+        if int(self.num_chains) < 4:
+            raise MCMCInferenceError("production recipes require at least four chains")
         if int(self.warmup_steps) < 1 or int(self.segment_size) < 1:
             raise MCMCInferenceError("warmup and retained draw counts must be positive")
         if not support or len(support) != len(set(support)) or min(support) < 1:
@@ -439,6 +439,7 @@ def run_mcmc_grid(
     run_label: str,
     recipe: Optional[FamilyRecipe] = None,
     truth_noise_sd: float = 1.0,
+    production_num_chains: Optional[int] = None,
     production_warmup_steps: Optional[int] = None,
     production_draws: Optional[int] = None,
     artifact_root: Optional[Any] = None,
@@ -487,6 +488,8 @@ def run_mcmc_grid(
             production_warmup_steps = artifact_config.get("warmup_steps")
         if production_draws is None:
             production_draws = artifact_config.get("segment_size")
+        if production_num_chains is None:
+            production_num_chains = artifact_config.get("num_chains")
 
     def positive_override(name: str, value: Optional[int], default: int) -> int:
         if value is None:
@@ -500,6 +503,11 @@ def run_mcmc_grid(
 
     effective_production = replace(
         recipe.production,
+        num_chains=positive_override(
+            "production_num_chains",
+            production_num_chains,
+            recipe.production.num_chains,
+        ),
         warmup_steps=positive_override(
             "production_warmup_steps",
             production_warmup_steps,

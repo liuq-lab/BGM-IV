@@ -2,7 +2,14 @@
 
 This module deliberately has no TensorFlow dependency.  Candidate training is
 owned by the caller; the functions here define the reproducible contract used
-to score and select one completed EGM candidate before BGM training begins.
+to select one fully trained candidate.
+
+Protocol (one rule for every benchmark): every EGM warm start is continued
+through the BGM stage, then the candidate with the smallest *training-set*
+IV-moment residual under the MAP latent readout is selected, and every
+structural readout (MAP, encoder, MCMC) is reported from that one model.  The
+EGM tail-window score is still recorded per candidate as a diagnostic, but it
+no longer enters the selection.
 """
 
 from __future__ import annotations
@@ -18,29 +25,31 @@ from .hashing import sha256_json
 
 
 DEFAULT_EGM_NUM_WARM_STARTS = 1
-DEFAULT_EGM_SELECTION_TOP_K = 1
 EGM_SCORE_WINDOW_SIZE = 10
-EGM_SELECTOR_TEMPERATURE = 0.05
-EGM_SELECTOR_VERSION = "relative-loss-softmax"
+EGM_SELECTOR_VERSION = "train-iv-map-post-bgm"
+EGM_SELECTION_CRITERION = "train_iv_map"
 EGM_CANDIDATE_MANIFEST_VERSION = "egm-candidate-manifest"
 EGM_SELECTION_MANIFEST_VERSION = "egm-selection-manifest"
 
 EGM_INIT_SEED_NAMESPACE = "egm-init"
 EGM_SCHEDULE_SEED_NAMESPACE = "egm-schedule"
-EGM_SELECTOR_SEED_NAMESPACE = "egm-selector"
 POST_EGM_SEED_NAMESPACE = "post-egm"
-EGM_SELECTOR_DRAW_NAMESPACE = "selector-draw"
+EGM_CRITERION_SEED_NAMESPACE = "egm-criterion"
 
+# Namespaces whose derived seed is specific to one candidate.
+_CANDIDATE_SEED_NAMESPACES = frozenset(
+    {EGM_INIT_SEED_NAMESPACE, EGM_CRITERION_SEED_NAMESPACE}
+)
 _SEED_NAMESPACES = frozenset(
     {
         EGM_INIT_SEED_NAMESPACE,
         EGM_SCHEDULE_SEED_NAMESPACE,
-        EGM_SELECTOR_SEED_NAMESPACE,
         POST_EGM_SEED_NAMESPACE,
+        EGM_CRITERION_SEED_NAMESPACE,
     }
 )
 _SEED_MODULUS = 2**31 - 1
-_RELATIVE_LOSS_EPSILON = 1e-12
+_REMOVED_SELECTION_KEYS = ("egm_selection_top_k",)
 
 
 class MultistartConfigurationError(ValueError):
@@ -79,6 +88,13 @@ def validate_multistart_config(
     if not isinstance(params, Mapping):
         raise MultistartConfigurationError("params must be a mapping")
     normalized = dict(params)
+    for removed in _REMOVED_SELECTION_KEYS:
+        if removed in normalized:
+            raise MultistartConfigurationError(
+                f"{removed} is no longer supported: every warm start is continued "
+                "through BGM and the candidate with the smallest training-set "
+                "IV-moment residual (MAP readout) is selected; remove the key"
+            )
     num_starts = _require_int(
         "egm_num_warm_starts",
         normalized.get(
@@ -86,17 +102,6 @@ def validate_multistart_config(
         ),
         minimum=1,
     )
-    top_k = _require_int(
-        "egm_selection_top_k",
-        normalized.get(
-            "egm_selection_top_k", DEFAULT_EGM_SELECTION_TOP_K
-        ),
-        minimum=1,
-    )
-    if top_k > num_starts:
-        raise MultistartConfigurationError(
-            "egm_selection_top_k must be <= egm_num_warm_starts"
-        )
 
     if num_starts > 1:
         if not _require_bool("save_model", normalized.get("save_model", False)):
@@ -118,14 +123,13 @@ def validate_multistart_config(
                 "EGM multistart requires training_grid_monitor=false"
             )
         # ``--mcmc-only`` restores an already-trained multistart checkpoint and
-        # does not launch candidate training.  Keep the public 10/3 config in
-        # the manifest so restore can verify the estimator that produced the
+        # does not launch candidate training.  Keep the public warm-start count
+        # in the manifest so restore can verify the estimator that produced the
         # checkpoint.  The caller is responsible for dispatching restore
         # instead of training whenever the flag is present.
         del mcmc_only
 
     normalized["egm_num_warm_starts"] = num_starts
-    normalized["egm_selection_top_k"] = top_k
     return normalized
 
 
@@ -185,16 +189,18 @@ def derive_multistart_seed(
     if namespace not in _SEED_NAMESPACES:
         raise ValueError(f"unknown multistart seed namespace: {namespace!r}")
 
-    if namespace == EGM_INIT_SEED_NAMESPACE:
+    if namespace in _CANDIDATE_SEED_NAMESPACES:
         if candidate_id is None:
-            raise ValueError("candidate_id is required for an EGM init seed")
+            raise ValueError(
+                f"candidate_id is required for the {namespace!r} seed namespace"
+            )
         candidate_value: Optional[int] = _require_int(
             "candidate_id", candidate_id, minimum=0
         )
     else:
         if candidate_id is not None:
             raise ValueError(
-                "candidate_id is only valid for the EGM init seed namespace"
+                "candidate_id is only valid for the per-candidate seed namespaces"
             )
         candidate_value = None
 
@@ -225,7 +231,14 @@ def derive_multistart_seeds(
     *,
     run_seed: int,
 ) -> dict[str, Any]:
-    """Derive all independent random streams for one outer data repeat."""
+    """Derive all independent random streams for one outer data repeat.
+
+    ``init_seeds`` differ per candidate (network initialization only);
+    ``schedule_seed`` and ``post_egm_seed`` are shared by every candidate so the
+    EGM minibatch schedule and the BGM continuation are identical across
+    candidates; ``criterion_seeds`` fix the Monte Carlo draws of the per-candidate
+    selection criterion.
+    """
 
     count = _require_int(
         "egm_num_warm_starts", num_warm_starts, minimum=1
@@ -244,12 +257,18 @@ def derive_multistart_seeds(
         "schedule_seed": derive_multistart_seed(
             *common, EGM_SCHEDULE_SEED_NAMESPACE, run_seed=run_seed
         ),
-        "selector_seed": derive_multistart_seed(
-            *common, EGM_SELECTOR_SEED_NAMESPACE, run_seed=run_seed
-        ),
         "post_egm_seed": derive_multistart_seed(
             *common, POST_EGM_SEED_NAMESPACE, run_seed=run_seed
         ),
+        "criterion_seeds": [
+            derive_multistart_seed(
+                *common,
+                EGM_CRITERION_SEED_NAMESPACE,
+                run_seed=run_seed,
+                candidate_id=candidate_id,
+            )
+            for candidate_id in range(count)
+        ],
     }
 
 
@@ -311,133 +330,87 @@ def rank_finite_candidates(
     )
 
 
-def relative_loss_softmax(
-    ranked_scores: Sequence[Real],
-    *,
-    temperature: float = EGM_SELECTOR_TEMPERATURE,
-    epsilon: float = _RELATIVE_LOSS_EPSILON,
-) -> tuple[float, ...]:
-    """Convert nondecreasing loss scores into relative-loss probabilities."""
-
-    if not ranked_scores:
-        raise ValueError("ranked_scores cannot be empty")
-    if isinstance(temperature, bool) or not isinstance(temperature, Real):
-        raise ValueError("temperature must be a positive finite number")
-    temperature_value = float(temperature)
-    if not math.isfinite(temperature_value) or temperature_value <= 0.0:
-        raise ValueError("temperature must be a positive finite number")
-    if isinstance(epsilon, bool) or not isinstance(epsilon, Real):
-        raise ValueError("epsilon must be a positive finite number")
-    epsilon_value = float(epsilon)
-    if not math.isfinite(epsilon_value) or epsilon_value <= 0.0:
-        raise ValueError("epsilon must be a positive finite number")
-
-    scores: list[float] = []
-    for value in ranked_scores:
-        score = _finite_score(value)
-        if score is None:
-            raise ValueError("ranked_scores must contain only finite losses")
-        scores.append(score)
-    if any(right < left for left, right in zip(scores, scores[1:])):
-        raise ValueError("ranked_scores must be nondecreasing")
-
-    baseline = scores[0]
-    denominator = baseline + epsilon_value
-    logits = [
-        -((score - baseline) / denominator) / temperature_value
-        for score in scores
-    ]
-    max_logit = max(logits)
-    weights = [math.exp(logit - max_logit) for logit in logits]
-    total = math.fsum(weights)
-    probabilities = [weight / total for weight in weights]
-    # Force an exact sum of one without changing the first K-1 probabilities.
-    probabilities[-1] = 1.0 - math.fsum(probabilities[:-1])
-    return tuple(probabilities)
-
-
-def selector_uniform_draw(selector_seed: int) -> float:
-    """Map a selector seed to one version-stable draw in ``[0, 1)``."""
-
-    seed = _require_int("selector_seed", selector_seed, minimum=0)
-    digest = hashlib.sha256(
-        f"{EGM_SELECTOR_VERSION}\0{EGM_SELECTOR_DRAW_NAMESPACE}\0{seed}".encode(
-            "utf-8"
-        )
-    ).digest()
-    integer = int.from_bytes(digest[:8], "big")
-    return integer / float(2**64)
-
-
 def _json_payload_hash(namespace: str, payload: Mapping[str, Any]) -> str:
     # sha256_json also proves that the payload is JSON serializable and contains
     # no NaN or infinity values.
     return sha256_json(namespace, payload)
 
 
-def select_egm_candidate(
-    candidate_scores: Mapping[int, Any],
-    *,
-    top_k: int,
-    selector_seed: int,
-) -> dict[str, Any]:
-    """Rank candidates, sample one from top-k, and return an audit manifest."""
-
-    required = _require_int("top_k", top_k, minimum=1)
-    ranking = rank_finite_candidates(candidate_scores, top_k=required)
-    top = ranking[:required]
-    probabilities = relative_loss_softmax(
-        [record["score"] for record in top]
-    )
-    draw = selector_uniform_draw(selector_seed)
-
-    cumulative = 0.0
-    selected_index = len(top) - 1
-    top_payload: list[dict[str, Any]] = []
-    baseline = float(top[0]["score"])
-    for index, (record, probability) in enumerate(zip(top, probabilities)):
-        cumulative = 1.0 if index == len(top) - 1 else cumulative + probability
-        if draw < cumulative and selected_index == len(top) - 1:
-            selected_index = index
-        top_payload.append(
-            {
-                **record,
-                "relative_loss_gap": (
-                    (float(record["score"]) - baseline)
-                    / (baseline + _RELATIVE_LOSS_EPSILON)
-                ),
-                "probability": probability,
-                "cdf_upper": cumulative,
-            }
-        )
-
-    serialized_scores = []
+def _serialize_scores(candidate_scores: Mapping[int, Any]) -> list[dict[str, Any]]:
+    serialized = []
+    seen: set[int] = set()
     for raw_id, raw_score in candidate_scores.items():
         candidate_id = _candidate_id(raw_id)
+        if candidate_id in seen:
+            raise ValueError(f"duplicate candidate ID: {candidate_id}")
+        seen.add(candidate_id)
         finite_score = _finite_score(raw_score)
-        serialized_scores.append(
+        serialized.append(
             {
                 "candidate_id": candidate_id,
                 "score": finite_score,
                 "finite": finite_score is not None,
             }
         )
-    serialized_scores.sort(key=lambda record: record["candidate_id"])
+    serialized.sort(key=lambda record: record["candidate_id"])
+    return serialized
 
-    selected = top_payload[selected_index]
+
+def select_candidate_by_criterion(
+    candidate_criteria: Mapping[int, Any],
+    *,
+    egm_tail_scores: Optional[Mapping[int, Any]] = None,
+) -> dict[str, Any]:
+    """Select the candidate with the smallest post-BGM training criterion.
+
+    ``candidate_criteria`` maps candidate id -> training-set IV-moment residual
+    under the MAP latent readout, measured after the BGM stage on the same
+    training rows the candidate was fitted on.  The rule is a deterministic
+    argmin with a candidate-id tie break; NaN/inf/None values are scientific
+    failures and are excluded, and at least one finite candidate is required.
+    ``egm_tail_scores`` (the EGM tail-window score of each candidate) is only
+    recorded as a diagnostic so the two orderings can be compared post hoc.
+    """
+
+    if not isinstance(candidate_criteria, Mapping):
+        raise ValueError("candidate_criteria must be a mapping")
+    ranking = rank_finite_candidates(candidate_criteria, top_k=1)
+    selected = ranking[0]
+    serialized_criteria = _serialize_scores(candidate_criteria)
+
+    egm_ranking: list[dict[str, Any]] = []
+    selected_egm_rank: Optional[int] = None
+    if egm_tail_scores is not None:
+        if not isinstance(egm_tail_scores, Mapping):
+            raise ValueError("egm_tail_scores must be a mapping")
+        if set(_candidate_id(key) for key in egm_tail_scores) != set(
+            record["candidate_id"] for record in serialized_criteria
+        ):
+            raise ValueError(
+                "egm_tail_scores must cover exactly the candidates being selected"
+            )
+        try:
+            egm_ranking = list(rank_finite_candidates(egm_tail_scores, top_k=1))
+        except CandidateSelectionError:
+            egm_ranking = []
+        for record in egm_ranking:
+            if record["candidate_id"] == selected["candidate_id"]:
+                selected_egm_rank = int(record["rank"])
+
     payload: dict[str, Any] = {
         "manifest_version": EGM_SELECTION_MANIFEST_VERSION,
         "selector_version": EGM_SELECTOR_VERSION,
-        "selector_temperature": EGM_SELECTOR_TEMPERATURE,
-        "selection_top_k": required,
-        "candidate_scores": serialized_scores,
+        "selection_criterion": EGM_SELECTION_CRITERION,
+        "candidate_criteria": serialized_criteria,
         "finite_ranking": list(ranking),
-        "top_k_candidates": top_payload,
-        "selector_seed": int(selector_seed),
-        "uniform_draw": draw,
-        "selected_rank": selected["rank"],
-        "selected_candidate_id": selected["candidate_id"],
-        "selected_probability": selected["probability"],
+        "selected_rank": int(selected["rank"]),
+        "selected_candidate_id": int(selected["candidate_id"]),
+        "selected_criterion": float(selected["score"]),
+        "egm_tail_scores": (
+            _serialize_scores(egm_tail_scores) if egm_tail_scores is not None else []
+        ),
+        "egm_tail_ranking": egm_ranking,
+        "selected_egm_tail_rank": selected_egm_rank,
         "uses_validation": False,
         "uses_holdout": False,
         "uses_test_grid": False,
@@ -469,8 +442,25 @@ def make_candidate_manifest(
     worker_pid: Optional[int] = None,
     device_names: Optional[Sequence[str]] = None,
     device_hash: Optional[str] = None,
+    bgm_checkpoint_path: Optional[str] = None,
+    bgm_checkpoint_hash: Optional[str] = None,
+    bgm_checkpoint_weight_hash: Optional[str] = None,
+    criterion_seed: Optional[int] = None,
+    train_iv_map: Optional[Any] = None,
+    train_iv_encoder: Optional[Any] = None,
+    train_mse_x: Optional[Any] = None,
+    train_mse_y: Optional[Any] = None,
+    train_mse_v: Optional[Any] = None,
+    bgm_seconds: Optional[Any] = None,
 ) -> dict[str, Any]:
-    """Build a canonical, JSON-safe candidate artifact with its own digest."""
+    """Build a canonical, JSON-safe candidate artifact with its own digest.
+
+    ``full_train_l2_loss_y`` / ``tail_mean_score`` describe the EGM stage
+    (diagnostic only).  The ``bgm_*`` and ``train_*`` fields describe the same
+    candidate after its BGM continuation; ``train_iv_map`` is the selection
+    criterion.  ``status`` is ``"completed"`` only when both stages finished
+    with finite values.
+    """
 
     candidate_value = _candidate_id(candidate_id)
     init_value = _require_int("init_seed", init_seed, minimum=0)
@@ -527,6 +517,22 @@ def make_candidate_manifest(
         ),
         "device_names": [str(value) for value in (device_names or ())],
         "device_hash": device_hash,
+        "bgm_checkpoint_path": bgm_checkpoint_path,
+        "bgm_checkpoint_hash": bgm_checkpoint_hash,
+        "bgm_checkpoint_weight_hash": bgm_checkpoint_weight_hash,
+        "criterion_seed": (
+            None
+            if criterion_seed is None
+            else _require_int("criterion_seed", criterion_seed, minimum=0)
+        ),
+        "train_iv_map": _finite_score(train_iv_map),
+        "train_iv_encoder": _finite_score(train_iv_encoder),
+        "train_mse_x": _finite_score(train_mse_x),
+        "train_mse_y": _finite_score(train_mse_y),
+        "train_mse_v": _finite_score(train_mse_v),
+        "bgm_seconds": (
+            None if bgm_seconds is None else float(bgm_seconds)
+        ),
     }
     # Validate optional fields before hashing so Path objects and NaN timestamps
     # cannot leak into a manifest that only appears JSON serializable.
@@ -559,15 +565,13 @@ def verify_manifest_hash(
 __all__ = [
     "CandidateSelectionError",
     "DEFAULT_EGM_NUM_WARM_STARTS",
-    "DEFAULT_EGM_SELECTION_TOP_K",
     "EGM_CANDIDATE_MANIFEST_VERSION",
+    "EGM_CRITERION_SEED_NAMESPACE",
     "EGM_INIT_SEED_NAMESPACE",
     "EGM_SCHEDULE_SEED_NAMESPACE",
     "EGM_SCORE_WINDOW_SIZE",
+    "EGM_SELECTION_CRITERION",
     "EGM_SELECTION_MANIFEST_VERSION",
-    "EGM_SELECTOR_SEED_NAMESPACE",
-    "EGM_SELECTOR_DRAW_NAMESPACE",
-    "EGM_SELECTOR_TEMPERATURE",
     "EGM_SELECTOR_VERSION",
     "MultistartConfigurationError",
     "POST_EGM_SEED_NAMESPACE",
@@ -575,10 +579,8 @@ __all__ = [
     "derive_multistart_seeds",
     "make_candidate_manifest",
     "rank_finite_candidates",
-    "relative_loss_softmax",
     "score_evaluation_iterations",
-    "select_egm_candidate",
-    "selector_uniform_draw",
+    "select_candidate_by_criterion",
     "validate_multistart_config",
     "verify_manifest_hash",
 ]

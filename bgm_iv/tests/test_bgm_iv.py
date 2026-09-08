@@ -459,6 +459,76 @@ def test_set_overrides_parse_yaml_values_and_apply_in_order():
         main_module._apply_config_overrides({}, ["n_samples"])
 
 
+def test_mcmc_yaml_controls_are_inference_only_and_manifest_excluded():
+    base = {"dataset": "Sim_Demand_Design_Mnist_IV", "fit_epochs": 200}
+    params = {
+        **base,
+        "mcmc_num_chains": 4,
+        "mcmc_production_warmup_steps": 2000,
+        "mcmc_production_draws": 5000,
+    }
+    main_module._apply_mcmc_inference_config(params)
+
+    assert params[main_module._MCMC_INFERENCE_OPTIONS_KEY] == {
+        "production_num_chains": 4,
+        "production_warmup_steps": 2000,
+        "production_draws": 5000,
+    }
+    assert not set(main_module._MCMC_CONFIG_FIELDS) & set(params)
+    assert main_module._manifest_params(params) == main_module._manifest_params(base)
+
+
+@pytest.mark.parametrize(
+    "updates,match",
+    [
+        ({"mcmc_num_chains": 4}, "provided together"),
+        (
+            {
+                "mcmc_num_chains": 3,
+                "mcmc_production_warmup_steps": 2000,
+                "mcmc_production_draws": 5000,
+            },
+            "mcmc_num_chains",
+        ),
+        (
+            {
+                "mcmc_num_chains": 4,
+                "mcmc_production_warmup_steps": True,
+                "mcmc_production_draws": 5000,
+            },
+            "mcmc_production_warmup_steps",
+        ),
+        (
+            {
+                "mcmc_num_chains": 4,
+                "mcmc_production_warmup_steps": 2000,
+                "mcmc_production_draws": 0,
+            },
+            "mcmc_production_draws",
+        ),
+    ],
+)
+def test_mcmc_yaml_controls_reject_partial_or_invalid_values(updates, match):
+    with pytest.raises(ValueError, match=match):
+        main_module._apply_mcmc_inference_config(dict(updates))
+
+
+def test_all_public_demand_design_yamls_expose_the_mcmc_budget():
+    config_names = (
+        "Sim_Demand_Design_IV.yaml",
+        "Sim_Demand_Design_Vector_IV.yaml",
+        "Sim_Demand_Design_Mnist_IV.yaml",
+        "Sim_Demand_Design_Mnist_Feature_IV.yaml",
+    )
+    root = Path(main_module.__file__).resolve().parent / "configs"
+    for name in config_names:
+        with (root / name).open(encoding="utf-8") as handle:
+            params = main_module.yaml.safe_load(handle)
+        assert params["mcmc_num_chains"] == 4
+        assert params["mcmc_production_warmup_steps"] == 2000
+        assert params["mcmc_production_draws"] == 5000
+
+
 def test_build_arg_parser_accepts_num_tasks():
     parser = main_module._build_arg_parser()
     args = parser.parse_args(["-c", "configs/Sim_Demand_Design_IV.yaml", "-t", "5"])
@@ -503,6 +573,7 @@ def test_mcmc_ablation_cli_normalizes_private_inference_options():
     main_module._apply_mcmc_inference_cli(params, args)
 
     assert params[main_module._MCMC_INFERENCE_OPTIONS_KEY] == {
+        "production_num_chains": None,
         "production_warmup_steps": 2000,
         "production_draws": 5000,
         "artifact_root": "/tmp/artifacts",
@@ -567,6 +638,34 @@ def test_mcmc_ablation_cli_requires_restore_mode_and_is_manifest_excluded():
     assert main_module._manifest_params(private) == main_module._manifest_params(base)
 
 
+def test_mcmc_ablation_cli_overrides_yaml_budget_but_preserves_chain_count():
+    parser = main_module._build_arg_parser()
+    args = parser.parse_args(
+        [
+            "-c",
+            "x.yaml",
+            "--mcmc-only",
+            "stamp",
+            "--mcmc-production-warmup-steps",
+            "3000",
+            "--mcmc-production-draws",
+            "4000",
+        ]
+    )
+    params = {
+        "_mcmc_only_timestamp": "stamp",
+        "mcmc_num_chains": 5,
+        "mcmc_production_warmup_steps": 2000,
+        "mcmc_production_draws": 5000,
+    }
+    main_module._apply_mcmc_inference_config(params)
+    main_module._apply_mcmc_inference_cli(params, args)
+    options = params[main_module._MCMC_INFERENCE_OPTIONS_KEY]
+    assert options["production_num_chains"] == 5
+    assert options["production_warmup_steps"] == 3000
+    assert options["production_draws"] == 4000
+
+
 def test_mcmc_readout_artifact_allows_prefixes_and_rejects_production_options():
     parser = main_module._build_arg_parser()
     args = parser.parse_args(
@@ -626,6 +725,7 @@ def test_run_structural_mcmc_passes_ablation_options_and_records_references(
         "repeat_id": 0,
         "seed": 0,
         main_module._MCMC_INFERENCE_OPTIONS_KEY: {
+            "production_num_chains": 5,
             "production_warmup_steps": 3000,
             "production_draws": 5000,
             "artifact_root": str(tmp_path),
@@ -651,6 +751,7 @@ def test_run_structural_mcmc_passes_ablation_options_and_records_references(
 
     assert captured["production_warmup_steps"] == 3000
     assert captured["production_draws"] == 5000
+    assert captured["production_num_chains"] == 5
     assert captured["artifact_root"] == str(tmp_path)
     assert captured["arm_id"] == "w3000_d5000"
     assert captured["readout_prefixes"] == [3000, 4000, 5000]
@@ -658,6 +759,7 @@ def test_run_structural_mcmc_passes_ablation_options_and_records_references(
     assert record["reference_metrics"] == {"map": 1.0, "encoder": 2.0}
 
     params[main_module._MCMC_INFERENCE_OPTIONS_KEY] = {
+        "production_num_chains": 4,
         "production_warmup_steps": None,
         "production_draws": None,
         "artifact_root": None,
@@ -1513,7 +1615,6 @@ def test_main_configures_multistart_parent_before_dataset_runner(monkeypatch, tm
                 "rho: 0.5",
                 "n_repeat: 1",
                 "egm_num_warm_starts: 10",
-                "egm_selection_top_k: 3",
             ]
         )
         + "\n",
@@ -1741,9 +1842,10 @@ def test_mcmc_only_restores_inference_state_without_training(monkeypatch, tmp_pa
     model.ckpt_manager.save(0)
     selection_provenance = {
         "egm_num_warm_starts": 10,
-        "egm_selection_top_k": 3,
+        "egm_selector_version": "train-iv-map-post-bgm",
+        "egm_selection_criterion": "train_iv_map",
         "egm_selected_candidate_id": 4,
-        "egm_selected_rank": 2,
+        "egm_selected_criterion": 161.6,
     }
     main_module._write_training_manifest(
         model,

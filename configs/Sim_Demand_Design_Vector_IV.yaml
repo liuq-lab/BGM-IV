@@ -14,12 +14,10 @@ fit_epochs_per_eval: 10
 fit_batch_size: 32
 fit_egm_n_iter: 50000
 fit_egm_batches_per_eval: 500
-# Ten EGM initializations are scored only with the deterministic full-training
-# EGM outcome loss.  A single member of the three best-scoring starts is drawn
-# by the fixed, manifest-seeded relative-loss softmax selector and is the only
-# start continued through BGM.
+# Ten warm starts: every start runs EGM and BGM; the start with the smallest
+# training-set IV-moment residual (MAP readout, measured after BGM) is the one
+# model every structural readout is reported from.
 egm_num_warm_starts: 10
-egm_selection_top_k: 3
 fit_first_stage_warmup_epochs: 0
 z_dims: [2,1,1,2]
 lr_theta: 0.0001
@@ -53,3 +51,7 @@ training_grid_monitor: false
 # map / encoder are point readouts; mcmc is the full-grid posterior integral.
 structural_methods: [map, encoder, mcmc]
 mcmc_family: vector
+# MCMC production budget. Draws are retained draws per chain.
+mcmc_num_chains: 4
+mcmc_production_warmup_steps: 2000
+mcmc_production_draws: 5000

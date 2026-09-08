@@ -61,3 +61,7 @@ training_grid_monitor: false
 # --- structural evaluation --------------------------------------------------
 structural_methods: [map, encoder, mcmc]
 mcmc_family: mnist_feature
+# MCMC production budget. Draws are retained draws per chain.
+mcmc_num_chains: 4
+mcmc_production_warmup_steps: 2000
+mcmc_production_draws: 5000

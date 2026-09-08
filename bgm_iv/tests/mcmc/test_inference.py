@@ -128,6 +128,13 @@ def test_family_recipes_pin_requested_production_settings():
     )
 
 
+def test_production_chain_count_allows_four_or_more_only():
+    FAMILY_RECIPES["vector"].production.validate()
+    replace(FAMILY_RECIPES["vector"].production, num_chains=5).validate()
+    with pytest.raises(MCMCInferenceError, match="at least four chains"):
+        replace(FAMILY_RECIPES["vector"].production, num_chains=3).validate()
+
+
 def test_seeds_are_content_derived_and_stage_distinct():
     first = derive_mcmc_seeds("vector", 0, "checkpoint")
     assert first == derive_mcmc_seeds("vector", 0, "checkpoint")
@@ -215,6 +222,7 @@ def test_ablation_overrides_save_before_prefix_readouts(tmp_path):
         checkpoint_identity="tiny-prefix",
         run_label="tiny-prefix",
         recipe=_smoke_recipe(family),
+        production_num_chains=5,
         production_warmup_steps=3,
         production_draws=5,
         artifact_root=tmp_path,
@@ -232,7 +240,7 @@ def test_ablation_overrides_save_before_prefix_readouts(tmp_path):
     assert result["artifact"]["draw_shape"][0] == 5
     np.testing.assert_array_equal(
         np.load(result["artifact"]["draws_path"], allow_pickle=False).shape,
-        (5, 4, 2, 4),
+        (5, 5, 2, 4),
     )
     assert result["sampler"]["acceptance"]["per_chain"]
 
@@ -320,6 +328,7 @@ def test_artifact_readout_skips_sampling_and_revalidates_context(
     "kwargs,message",
     [
         ({"production_warmup_steps": 0}, "positive integer"),
+        ({"production_num_chains": 3}, "at least four chains"),
         ({"production_draws": True}, "positive integer"),
         ({"production_draws": 5, "readout_prefixes": [6]}, "between"),
         ({"artifact_root": "somewhere"}, "both be set"),

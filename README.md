@@ -126,35 +126,43 @@ For a legacy single-start Cartesian sweep, override both multistart fields to
 requires a distinct visible GPU. `--repeat-id` accepts one integer in
 `0, ..., n_repeat - 1` and requires `-t 1`.
 
-### EGM multistart initialization
+### Warm-start multistart and model selection
 
-The Vector benchmark enables a training-only EGM multistart procedure with:
+Every benchmark configuration enables a training-only multistart procedure
+with:
 
 ```yaml
 egm_num_warm_starts: 10
-egm_selection_top_k: 3
 ```
 
 All starts use the same complete training sample and optimization schedule but
 different initialization seeds derived from the cell's `run_seed`.  The same
-master seed also deterministically derives the shared schedule, selector draw,
-and post-EGM/BGM stream.  During the final ten EGM
-evaluation points, each start is scored by the same `l2_loss_y` term evaluated
-deterministically over every training row with the model's fixed eight-node
-Gauss--Hermite treatment integral.  No validation split, simulated holdout,
-evaluation grid, or structural truth is available to the selector.
+master seed also deterministically derives the shared EGM schedule, the shared
+post-EGM/BGM stream, and one criterion stream per start.  Each start is trained
+end to end in its own worker process: the EGM stage, then the BGM stage from
+the persisted EGM state (a fresh model under the shared post-EGM seed, exactly
+as a single continuation would be), then the selection criterion.
 
-The three lowest-scoring starts receive probabilities from a fixed
-relative-loss softmax with temperature `0.05`; a manifest-derived random draw
-selects exactly one terminal EGM checkpoint.  Only that checkpoint continues
-through BGM, MAP, encoder, and MCMC evaluation.  Omitting the fields defaults
-to the legacy single-start path (`1` start and top `1`).  The extra EGM starts
-are part of the estimator's compute budget and are not independent repeats.
+The selection criterion is the training-set IV-moment residual under the MAP
+latent readout, measured after BGM on the rows the start was fitted on: the
+mean squared gap between the observed training outcome and
+`E[f(X, z) | w, z]` with `z` inferred from `v` alone and `X` drawn from the
+model's own first stage.  The start with the smallest residual is selected by
+a deterministic argmin (candidate-id tie break), and MAP, encoder, and MCMC
+readouts are all reported from that one model.  No validation split, simulated
+holdout, evaluation grid, or structural truth is available to the selector.
+The EGM tail-window score (`l2_loss_y` over every training row with the fixed
+eight-node Gauss--Hermite treatment integral, averaged over the last ten EGM
+evaluation points) is still recorded per start as a diagnostic, but it does not
+enter the selection.  Omitting the field defaults to the legacy single-start
+path; `egm_selection_top_k` is no longer accepted.  The extra starts are part
+of the estimator's compute budget and are not independent repeats.
 
-Candidate workers persist an optimizer-free `egm-transition` checkpoint.  It
-contains only the trained networks and EGM variance EMA needed to initialize
-the one BGM continuation; EGM optimizer slots are deliberately not resumable.
-After BGM, the training manifest binds a separate optimizer-free
+Candidate workers persist an optimizer-free `egm-transition` checkpoint (the
+trained networks and EGM variance EMA that initialize the BGM stage; EGM
+optimizer slots are deliberately not resumable) and, after BGM, an
+optimizer-free `bgm-final` checkpoint that the parent restores for the selected
+start.  The training manifest then binds a separate optimizer-free
 `inference-state` checkpoint used by structural evaluation and `--mcmc-only`.
 
 To restore a saved training checkpoint and run only structural evaluation and
@@ -172,6 +180,22 @@ the beginning.  It does not resume a partially completed MCMC chain.  Empty or
 whitespace-only timestamps are rejected before training can start.  Pilot and
 production seeds remain deterministically derived from `run_seed`, MCMC
 family, checkpoint identity, and stage; there is no public `mcmc_seed` option.
+
+Every demand-design YAML exposes the production sampling budget explicitly:
+
+```yaml
+# Draws are retained draws per chain.
+mcmc_num_chains: 4
+mcmc_production_warmup_steps: 2000
+mcmc_production_draws: 5000
+```
+
+The three values must be supplied together.  Production uses at least four
+chains; fewer chains fail before sampling.  These inference-only controls do
+not alter the training-manifest or checkpoint identity.  The family recipe is
+the backward-compatible fallback for older configs, while the YAML values
+override that fallback.  Private ablation CLI flags, when present, override
+the YAML warmup/draw counts without changing the YAML chain count.
 
 ## MNIST Cache
 
