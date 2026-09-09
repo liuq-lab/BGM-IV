@@ -35,6 +35,10 @@ from bgm_iv.datasets import (
 )
 import tensorflow as tf
 from bgm_iv.hashing import sha256_array, sha256_json, sha256_weights
+from bgm_iv.proxy_transform import (
+    VERSION as VECTOR_PCA_VERSION,
+    apply_pca, arm_label, fit_pca, parse_pca_dim, proxy_sha1, rounded_sha1,
+)
 from bgm_iv.egm_multistart import (
     EGM_SELECTION_CRITERION,
     EGM_SELECTOR_VERSION,
@@ -119,6 +123,13 @@ _DEMAND_DESIGN_DATASET_META = {
         "seed_key": "feature_seed",
         "uses_rho": True,
     },
+    "Sim_Demand_Design_Vector_PCAOnly_IV": {
+        "title": "Sim_Demand_Design_Vector_PCAOnly_IV",
+        "slug": "sim_demand_design_vector_pcaonly_iv",
+        "config_name": "Sim_Demand_Design_Vector_PCAOnly_IV.yaml",
+        "seed_key": "feature_seed",
+        "uses_rho": True,
+    },
 }
 
 
@@ -141,6 +152,12 @@ _DATASET_FIXED_BENCHMARK_DEFAULTS = {
         "noise_seed": 42,
     },
     "Sim_Demand_Design_Vector_IV": {
+        "vector_dim": 784,
+        "v_dim": 785,
+        "feature_seed": 42,
+        "test_vector_seed": 42,
+    },
+    "Sim_Demand_Design_Vector_PCAOnly_IV": {
         "vector_dim": 784,
         "v_dim": 785,
         "feature_seed": 42,
@@ -541,6 +558,13 @@ def _apply_demand_design_benchmark_defaults(params):
             "`v_dim` must be >= 785 for Sim_Demand_Design_Mnist_IV; "
             f"got {params['v_dim']!r}."
         )
+    if dataset == "Sim_Demand_Design_Vector_PCAOnly_IV":
+        if "proxy_transform" in params:
+            raise ValueError("use pca_dim; proxy_transform is derived, not a config input")
+        if "pca_dim" not in params:
+            raise ValueError("PCA-only config must explicitly supply pca_dim")
+        params["pca_dim"] = parse_pca_dim(params["pca_dim"])
+        params["proxy_transform"] = arm_label(params["pca_dim"])
 
     normalized = validate_multistart_config(
         params, mcmc_only=_is_mcmc_only(params)
@@ -697,6 +721,8 @@ def _render_demand_design_run_config(params):
         "feature_seed",
         "test_vector_seed",
         "representation_sd",
+        "pca_dim",
+        "proxy_transform",
         # recipe provenance
         "outcome_to_particles_weight",
         "covariate_block_scale",
@@ -980,6 +1006,12 @@ _FINAL_RESULT_COLUMNS = (
     "device_name",
     "hostname",
     "sigma_vector_softfloor_source",
+    "pca_dim",
+    "proxy_transform",
+    "pca_fit_sha1",
+    "train_proxy_sha1",
+    "test_pca_sha1_r4",
+    "vector_pca_version",
     "mcmc_only",
 )
 
@@ -1059,9 +1091,17 @@ def _build_final_results_row(params, history, final_results, provenance=None):
         "deterministic_training",
         "training_grid_monitor",
         "egm_num_warm_starts",
+        "pca_dim",
+        "proxy_transform",
     ):
         if key in params:
             row[key] = _blank(params.get(key))
+    # The PCA runner narrows a local params copy; outer serial/parallel writers
+    # retain the DGP params. Carry fitted metadata through returned provenance.
+    for key in ("pca_dim", "proxy_transform", "pca_fit_sha1", "train_proxy_sha1",
+                "test_pca_sha1_r4", "vector_pca_version"):
+        if key in provenance:
+            row[key] = _blank(provenance[key])
     if "outcome_to_particles_weight" not in params and "resolved_gamma" in provenance:
         row["outcome_to_particles_weight"] = provenance["resolved_gamma"]
     multistart = provenance.get("egm_multistart") or {}
@@ -1533,12 +1573,14 @@ _MODEL_CLASS_BY_DATASET = {
     "Sim_Demand_Design_IV": BGM_IV,
     "Sim_Demand_Design_Mnist_IV": BGM_IV_Image,
     "Sim_Demand_Design_Vector_IV": BGM_IV_Vector,
+    "Sim_Demand_Design_Vector_PCAOnly_IV": BGM_IV,
 }
 
 _MCMC_FAMILY_BY_DATASET = {
     "Sim_Demand_Design_IV": "demand",
     "Sim_Demand_Design_Mnist_IV": "mnist_pixel",
     "Sim_Demand_Design_Vector_IV": "vector",
+    "Sim_Demand_Design_Vector_PCAOnly_IV": "demand",
 }
 
 
@@ -1599,9 +1641,55 @@ def _validate_egm_multistart_run_shape(params):
         )
 
 
-def _initialize_egm_candidate_worker(use_gpu):
+_EGM_CANDIDATE_GPU_SLOT = None
+# The allocation the parent handed to this worker, captured BEFORE the
+# round-robin narrows CUDA_VISIBLE_DEVICES.  It is what the candidate
+# device-identity hash records, so all candidates of one run share one
+# hash whether they landed on GPU 0 or GPU 1 of the same allocation.
+_EGM_ALLOCATED_CUDA_VISIBLE_DEVICES = None
+
+
+def _assign_egm_candidate_gpu_slot(worker_index, visible_devices):
+    """Round-robin one visible GPU to a candidate worker.
+
+    ``visible_devices`` is the parent's ``CUDA_VISIBLE_DEVICES`` (Slurm sets it
+    for every ``--gpus`` allocation).  Returns ``(env_value, slot)``: the single
+    physical id this worker exposes to TensorFlow and its slot index.  With one
+    visible GPU every worker gets slot 0, which is byte-for-byte the historical
+    behaviour; with N GPUs the candidates spread 0,1,..,N-1,0,1,... instead of
+    all piling onto GPU 0 while the others idle.
+    """
+    ids = [item.strip() for item in str(visible_devices or "").split(",") if item.strip()]
+    if not ids:
+        return None, None
+    slot = int(worker_index) % len(ids)
+    return ids[slot], slot
+
+
+def _initialize_egm_candidate_worker(use_gpu, slot_counter=None):
     """Configure one isolated EGM candidate process."""
+    global _EGM_CANDIDATE_GPU_SLOT, _EGM_ALLOCATED_CUDA_VISIBLE_DEVICES
     _configure_tensorflow_threads(1, 1)
+    _EGM_ALLOCATED_CUDA_VISIBLE_DEVICES = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if use_gpu and slot_counter is not None:
+        with slot_counter.get_lock():
+            worker_index = int(slot_counter.value)
+            slot_counter.value = worker_index + 1
+        env_value, slot = _assign_egm_candidate_gpu_slot(
+            worker_index, os.environ.get("CUDA_VISIBLE_DEVICES")
+        )
+        if env_value is not None:
+            # Must precede TensorFlow's first device query: the platform is
+            # initialised lazily, so the child then enumerates exactly one
+            # physical GPU and ``gpu_slot=0`` below selects it.  The value is
+            # recorded in the candidate's device hash via CUDA_VISIBLE_DEVICES.
+            os.environ["CUDA_VISIBLE_DEVICES"] = env_value
+            _EGM_CANDIDATE_GPU_SLOT = slot
+            print(
+                f"EGM candidate worker {worker_index}: CUDA_VISIBLE_DEVICES="
+                f"{env_value} (round-robin slot {slot})",
+                flush=True,
+            )
     _configure_tensorflow_devices(
         bool(use_gpu),
         gpu_slot=0 if use_gpu else None,
@@ -1773,7 +1861,11 @@ def _run_egm_candidate_worker(
                 "egm-candidate-device",
                 {
                     "tensorflow_version": tf.__version__,
-                    "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+                    "cuda_visible_devices": (
+                        _EGM_ALLOCATED_CUDA_VISIBLE_DEVICES
+                        if _EGM_ALLOCATED_CUDA_VISIBLE_DEVICES is not None
+                        else os.environ.get("CUDA_VISIBLE_DEVICES")
+                    ),
                     "physical_devices": physical_devices,
                     "logical_training_devices": device_names,
                 },
@@ -2020,11 +2112,14 @@ def _fit_demand_design_model_multistart(params, train, *, criterion_data=None):
     )
     spawn_context = multiprocessing.get_context("spawn")
     results = []
+    # One shared counter hands every spawned worker a distinct index, from which
+    # it derives its GPU slot (round-robin over CUDA_VISIBLE_DEVICES).
+    gpu_slot_counter = spawn_context.Value("i", 0)
     with ProcessPoolExecutor(
         max_workers=num_starts,
         mp_context=spawn_context,
         initializer=_initialize_egm_candidate_worker,
-        initargs=(bool(normalized.get("use_gpu", False)),),
+        initargs=(bool(normalized.get("use_gpu", False)), gpu_slot_counter),
     ) as executor:
         futures = []
         for candidate_id, init_seed in enumerate(seeds["init_seeds"]):
@@ -2670,6 +2765,12 @@ _PROVENANCE_PARAM_KEYS = (
     "z_dims",
     "v_dim",
     "vector_dim",
+    "pca_dim",
+    "proxy_transform",
+    "pca_fit_sha1",
+    "train_proxy_sha1",
+    "test_pca_sha1_r4",
+    "vector_pca_version",
     "holdout_seed_offset",
 )
 
@@ -3211,6 +3312,107 @@ def _run_single_demand_design_vector_iv(params):
     )
 
 
+def _apply_proxy_arm(data, transform):
+    """Replace only the proxy block; never fit on a grid or holdout draw."""
+    out = dict(data)
+    v = np.asarray(data["v"])
+    out["v"] = np.concatenate(
+        [v[:, :1].astype(np.float32), apply_pca(transform, v[:, 1:])], axis=1
+    ).astype(np.float32)
+    return out
+
+
+def _standardize_demand_design_pcaonly_data(train, grid=None):
+    """Demand standardization with one shared proxy-block scale (k=1 identical)."""
+    stats = {key: _fit_standardizer(train[key]) for key in ("x", "y", "w")}
+    v = np.asarray(train["v"], dtype=np.float32)
+    mean = np.mean(v, axis=0, keepdims=True).astype(np.float32)
+    scale = np.std(v, axis=0, keepdims=True).astype(np.float32)
+    block = np.sqrt(np.mean(np.square(scale[:, 1:]))).astype(np.float32)
+    scale[:, 1:] = block
+    scale = np.where(scale < 1e-6, 1.0, scale).astype(np.float32)
+    stats["v"] = {"mean": mean, "scale": scale}
+    train_std = {key: _transform(train[key], stats[key]) for key in ("x", "y", "v", "w")}
+    train_std["y_struct"] = train["y_struct"]
+    grid_std = None
+    if grid is not None:
+        grid_std = {"x": _transform(grid["x"], stats["x"]),
+                    "v": _transform(grid["v"], stats["v"]), "y_struct": grid["y_struct"]}
+    return train_std, grid_std, stats
+
+
+def _run_single_demand_design_vector_pcaonly_iv(params):
+    """Vector DGP + frozen PCA + the demand model and its existing best-of-K."""
+    params = dict(params)
+    if not bool(params.get("normalize_before_training", True)):
+        raise ValueError("PCA-only supports only normalize_before_training: true")
+    k = parse_pca_dim(params["pca_dim"])
+    arm = arm_label(k)
+    params["pca_dim"], params["proxy_transform"] = k, arm
+    n_samples = int(params.get("n_samples", 5000))
+    rho = float(params.get("rho", 0.5))
+    run_seed = int(params.get("run_seed", params.get("seed", 0)))
+    simulate_kwargs = dict(v_dim=785, vector_dim=784,
+                           feature_seed=int(params.get("feature_seed", 42)),
+                           representation_sd=float(params.get("representation_sd", 0.5)))
+    train = simulate_demand_design_vector_iv(
+        n_samples=n_samples, rho=rho, seed=run_seed, **simulate_kwargs)
+    grid = make_demand_design_vector_grid(
+        price_points=int(params.get("price_points", 20)),
+        time_points=int(params.get("time_points", 20)),
+        test_vector_seed=int(params.get("test_vector_seed", 42)), **simulate_kwargs)
+    holdout_seed, holdout_n = _resolve_holdout_settings(params)
+    holdout = simulate_demand_design_vector_iv(
+        n_samples=holdout_n, rho=rho, seed=holdout_seed, **simulate_kwargs)
+    raw_proxy = np.asarray(train["v"])[:, 1:]
+    transform = fit_pca(raw_proxy, k)
+    train = _apply_proxy_arm(train, transform)
+    grid = _apply_proxy_arm(grid, transform)
+    holdout = _apply_proxy_arm(holdout, transform)
+    k_eff = 784 if k is None else k
+    pca_metadata = {
+        "pca_dim": k, "proxy_transform": arm, "pca_fit_sha1": transform["hash"],
+        "n_samples": n_samples, "rho": rho,
+        "train_proxy_sha1": proxy_sha1(raw_proxy),
+        "test_pca_sha1_r4": rounded_sha1(grid["v"][:, 1:]),
+        "vector_pca_version": VECTOR_PCA_VERSION,
+        "model_v_dim": 1 + k_eff, "model_vector_dim": k_eff,
+    }
+    params.update(pca_metadata)
+    params["v_dim"], params["vector_dim"] = 1 + k_eff, k_eff
+    print(f"[proxy arm] {arm}: model sees v_dim={1+k_eff} (vector_dim={k_eff}), "
+          f"fit hash={transform['hash']}")
+    run_config_text = _render_demand_design_run_config(params)
+    print(run_config_text)
+    ranges_text = _render_observed_ranges(train)
+    print(ranges_text)
+    methods = _resolve_structural_methods(params)
+    train_std, grid_std, stats = _standardize_demand_design_pcaonly_data(train, grid)
+    holdout_model = {"v": _transform(holdout["v"], stats["v"]),
+                     "w": _transform(holdout["w"], stats["w"]), "y": holdout["y"]}
+    preprocessor = AffinePreprocessorSpec(
+        mean=np.asarray(stats["v"]["mean"], np.float32).reshape(-1),
+        scale=np.asarray(stats["v"]["scale"], np.float32).reshape(-1),
+        name="pcaonly_v_standardizer")
+    model = _fit_or_restore_demand_design_model(
+        params, train_std,
+        evaluation_callback=_maybe_structural_monitor_callback(
+            params, grid_std["x"], grid_std["v"], grid["y_struct"], y_stats=stats["y"]),
+        criterion_data={"y_raw": train["y"], "y_stats": stats["y"]})
+    mcmc_context = None
+    if "mcmc" in methods:
+        mcmc_context = _mcmc_context(
+            params, grid_x_model=grid_std["x"], grid_v_raw=grid["v"],
+            truth_rows=grid["y_struct"], truth_label="vector_pcaonly_demand_design_grid_y_struct",
+            preprocessor=preprocessor, x_stats=stats["x"], y_stats=stats["y"])
+    return _finalize_demand_design_run(
+        params, model, train_model=train_std, grid_x_model=grid_std["x"],
+        grid_v_model=grid_std["v"], grid_truth=grid["y_struct"], y_stats=stats["y"],
+        methods=methods, mcmc_context=mcmc_context, holdout=holdout_model,
+        run_config_text=run_config_text, ranges_text=ranges_text,
+        space_label="DFIV-compatible original outcome space", extra_provenance=pca_metadata)
+
+
 def _select_demand_design_single_run_fn(dataset):
     if dataset == "Sim_Demand_Design_IV":
         return _run_single_demand_design_iv
@@ -3218,6 +3420,8 @@ def _select_demand_design_single_run_fn(dataset):
         return _run_single_demand_design_mnist_iv
     if dataset == "Sim_Demand_Design_Vector_IV":
         return _run_single_demand_design_vector_iv
+    if dataset == "Sim_Demand_Design_Vector_PCAOnly_IV":
+        return _run_single_demand_design_vector_pcaonly_iv
     raise ValueError(f"Unsupported demand-design dataset: {dataset}")
 
 
@@ -3443,6 +3647,10 @@ def run_demand_design_vector_iv(params):
     _run_demand_design_family(params, _run_single_demand_design_vector_iv)
 
 
+def run_demand_design_vector_pcaonly_iv(params):
+    _run_demand_design_family(params, _run_single_demand_design_vector_pcaonly_iv)
+
+
 def main():
     parser = _build_arg_parser()
     args = parser.parse_args()
@@ -3503,6 +3711,8 @@ def main():
         run_demand_design_mnist_iv(params)
     elif params["dataset"] == "Sim_Demand_Design_Vector_IV":
         run_demand_design_vector_iv(params)
+    elif params["dataset"] == "Sim_Demand_Design_Vector_PCAOnly_IV":
+        run_demand_design_vector_pcaonly_iv(params)
     else:
         raise ValueError(
             "Unsupported dataset. This clean package supports only "

@@ -366,6 +366,8 @@ def test_benchmark_defaults_reject_invalid_mnist_v_dim():
         ("Sim_Demand_Design_Vector_IV", "vector_dim", 128),
         ("Sim_Demand_Design_Vector_IV", "test_vector_seed", 99),
         ("Sim_Demand_Design_Vector_IV", "covariate_block_scale", "mean"),
+        ("Sim_Demand_Design_Vector_PCAOnly_IV", "vector_dim", 128),
+        ("Sim_Demand_Design_Vector_PCAOnly_IV", "v_dim", 7),
     ],
 )
 def test_benchmark_defaults_reject_non_default_hidden_fields(dataset, field, value):
@@ -501,6 +503,7 @@ def test_all_public_demand_design_yamls_expose_the_mcmc_budget():
         "Sim_Demand_Design_IV.yaml",
         "Sim_Demand_Design_Vector_IV.yaml",
         "Sim_Demand_Design_Mnist_IV.yaml",
+        "Sim_Demand_Design_Vector_PCAOnly_IV.yaml",
     )
     root = Path(main_module.__file__).resolve().parent / "configs"
     for name in config_names:
@@ -1899,3 +1902,59 @@ def test_holdout_criterion_uses_observed_outcome_and_instrument(tmp_path):
     out = main_module._evaluate_holdout_criterion(model, holdout)
     assert set(out) == {"holdout_iv_mse_map", "holdout_iv_mse_encoder"}
     assert all(np.isfinite(v) and v >= 0 for v in out.values())
+
+
+def test_assign_egm_candidate_gpu_slot_round_robins_visible_devices():
+    assign = main_module._assign_egm_candidate_gpu_slot
+    assert assign(0, None) == (None, None)
+    assert assign(3, "") == (None, None)
+    # one visible GPU: every worker lands on slot 0 (the historical behaviour)
+    assert assign(0, "0") == ("0", 0)
+    assert assign(7, "0") == ("0", 0)
+    assert [assign(i, "0,1")[0] for i in range(4)] == ["0", "1", "0", "1"]
+    assert [assign(i, "2,5,7")[1] for i in range(5)] == [0, 1, 2, 0, 1]
+
+
+def test_initialize_egm_candidate_worker_spreads_workers_over_visible_gpus(monkeypatch):
+    import multiprocessing
+    import os
+
+    seen = []
+    monkeypatch.setattr(main_module, "_configure_tensorflow_threads", lambda *a, **k: None)
+    monkeypatch.setattr(
+        main_module,
+        "_configure_tensorflow_devices",
+        lambda use_gpu, gpu_slot=None, verbose=True, strict_memory_growth=False: seen.append(
+            (bool(use_gpu), gpu_slot, os.environ.get("CUDA_VISIBLE_DEVICES"))
+        ),
+    )
+    monkeypatch.setattr(main_module.tf.config, "list_logical_devices", lambda kind: ["gpu"])
+    counter = multiprocessing.get_context("spawn").Value("i", 0)
+    for _ in range(3):
+        # every spawned child inherits the parent's full allocation list
+        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1")
+        main_module._initialize_egm_candidate_worker(True, counter)
+    assert [entry[2] for entry in seen] == ["0", "1", "0"]
+    assert all(entry[0] is True and entry[1] == 0 for entry in seen)
+    assert counter.value == 3
+    # the identity hash must see the parent's allocation, not the narrowed slot
+    assert main_module._EGM_ALLOCATED_CUDA_VISIBLE_DEVICES == "0,1"
+
+
+def test_initialize_egm_candidate_worker_without_counter_is_unchanged(monkeypatch):
+    import os
+
+    seen = []
+    monkeypatch.setattr(main_module, "_configure_tensorflow_threads", lambda *a, **k: None)
+    monkeypatch.setattr(
+        main_module,
+        "_configure_tensorflow_devices",
+        lambda use_gpu, gpu_slot=None, verbose=True, strict_memory_growth=False: seen.append(
+            (bool(use_gpu), gpu_slot, strict_memory_growth, os.environ.get("CUDA_VISIBLE_DEVICES"))
+        ),
+    )
+    monkeypatch.setattr(main_module.tf.config, "list_logical_devices", lambda kind: ["gpu"])
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1")
+    main_module._initialize_egm_candidate_worker(True)
+    main_module._initialize_egm_candidate_worker(False)
+    assert seen == [(True, 0, True, "0,1"), (False, None, False, "0,1")]
