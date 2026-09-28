@@ -1,35 +1,22 @@
-"""Full-grid structural MCMC readout and predictive calibration.
-
-The sampler draws one latent state for every unique covariate target.  This
-module reuses those targets over every treatment/query row, streams the frozen
-outcome network over all retained draws, and reports the ordinary plug-in
-structural MSE plus exact Gaussian-mixture interval calibration.
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
-import time
-from typing import Any, Sequence
+from typing import Any
 
 import numpy as np
 from scipy.special import ndtr
 import tensorflow as tf
 
-from .target import sha256_array, sha256_json, sha256_weights
-
 
 class ReadoutError(RuntimeError):
-    """A structural-readout contract violation."""
+    pass
 
 
 @dataclass(frozen=True)
 class StructuralQueryTable:
-    """Stable unique-target catalog and the complete query table."""
-
-    unique_v: np.ndarray       # [U,V] model scale
-    query_x: np.ndarray        # [Q,1] model scale
-    query_inverse: np.ndarray  # [Q], query -> target
+    unique_v: np.ndarray
+    query_x: np.ndarray
+    query_inverse: np.ndarray
 
     def __post_init__(self) -> None:
         unique_v = np.asarray(self.unique_v, np.float32)
@@ -57,44 +44,8 @@ class StructuralQueryTable:
     def num_queries(self) -> int:
         return int(self.query_x.shape[0])
 
-    @property
-    def catalog_hash(self) -> str:
-        return sha256_array(self.unique_v)
-
-    @property
-    def query_hash(self) -> str:
-        return sha256_json(
-            "structural-query-table",
-            {
-                "catalog_hash": self.catalog_hash,
-                "query_x_hash": sha256_array(self.query_x),
-                "query_inverse_hash": sha256_array(self.query_inverse),
-            },
-        )
-
-    @property
-    def representative_rows(self) -> np.ndarray:
-        rep = np.full(self.num_targets, -1, np.int64)
-        for row, target in enumerate(self.query_inverse):
-            if rep[target] < 0:
-                rep[target] = int(row)
-        if np.any(rep < 0):
-            raise ReadoutError("every target must own at least one query")
-        return rep
-
-    def row_length_array(self, values: Any, name: str = "values") -> np.ndarray:
-        array = np.asarray(values)
-        if array.shape[0] != self.num_queries:
-            raise ReadoutError(
-                f"{name} must have one entry per query row "
-                f"({array.shape[0]} != {self.num_queries})"
-            )
-        return array
-
 
 def build_query_table(grid_x: Any, grid_v: Any) -> StructuralQueryTable:
-    """Deduplicate covariate rows in stable first-occurrence order."""
-
     grid_x = np.asarray(grid_x, np.float32).reshape(-1, 1)
     grid_v = np.asarray(grid_v, np.float32)
     if grid_v.ndim != 2 or grid_v.shape[0] != grid_x.shape[0]:
@@ -124,8 +75,6 @@ def gaussian_mixture_quantiles(
     *,
     iterations: int = 60,
 ) -> np.ndarray:
-    """Exact quantiles of row-wise equal-weight Gaussian mixtures."""
-
     means = np.asarray(means, np.float64)
     sds = np.asarray(sds, np.float64)
     probabilities = np.asarray(probabilities, np.float64).reshape(-1)
@@ -155,44 +104,15 @@ def gaussian_mixture_quantiles(
     return 0.5 * (lo + hi)
 
 
-@dataclass(frozen=True)
-class ReadoutConfig:
-    """Memory-bounded, all-draw full-grid readout settings."""
-
-    levels: Sequence[float] = (0.5, 0.8, 0.95)
-    truth_noise_sd: float = 1.0
-    query_chunk: int = 16
-    draw_chunk: int = 16384
-    bisection_iterations: int = 60
-
-    def validate(self) -> "ReadoutConfig":
-        levels = tuple(float(level) for level in self.levels)
-        if levels != (0.5, 0.8, 0.95):
-            raise ValueError("levels are fixed to (0.5,0.8,0.95)")
-        if not np.isfinite(self.truth_noise_sd) or self.truth_noise_sd <= 0:
-            raise ValueError("truth_noise_sd must be positive")
-        if int(self.query_chunk) < 1 or int(self.draw_chunk) < 1:
-            raise ValueError("readout chunks must be positive")
-        if int(self.bisection_iterations) < 20:
-            raise ValueError("bisection_iterations must be at least 20")
-        return self
-
-    def to_payload(self) -> dict[str, Any]:
-        return {
-            "levels": [float(level) for level in self.levels],
-            "truth_noise_sd": float(self.truth_noise_sd),
-            "query_chunk": int(self.query_chunk),
-            "draw_chunk": int(self.draw_chunk),
-            "bisection_iterations": int(self.bisection_iterations),
-            "scoring_unit": "query",
-            "draw_usage": "all_post_warmup_draws",
-            "quantile_method": "exact_gaussian_mixture_cdf_bisection",
-        }
+# The chunk sizes fix the summation order, and hence the floating-point result.
+LEVELS = (0.9, 0.95, 0.99)
+TRUTH_NOISE_SD = 1.0
+QUERY_CHUNK = 16
+DRAW_CHUNK = 16384
+BISECTION_ITERATIONS = 60
 
 
 class FullGridReadout:
-    """Compute MSE and predictive intervals over every query and draw."""
-
     def __init__(
         self,
         model: Any,
@@ -201,37 +121,28 @@ class FullGridReadout:
         *,
         outcome_shift: float,
         outcome_scale: float,
-        config: ReadoutConfig = ReadoutConfig(),
     ):
-        if bool(model.params.get("use_bnn", False)):
-            raise ReadoutError("stochastic BNN outcome head is not a fixed readout")
         self.model = model
         self.table = table
-        self.truth = np.asarray(
-            table.row_length_array(truth_rows_original, "truth"), np.float64
-        ).reshape(-1)
+        truth = np.asarray(truth_rows_original, np.float64)
+        if truth.shape[0] != table.num_queries:
+            raise ReadoutError(
+                "truth must have one entry per query row "
+                f"({truth.shape[0]} != {table.num_queries})"
+            )
+        self.truth = truth.reshape(-1)
         self.outcome_shift = float(outcome_shift)
         self.outcome_scale = float(outcome_scale)
         if not np.isfinite(self.outcome_shift):
             raise ReadoutError("outcome_shift must be finite")
         if not np.isfinite(self.outcome_scale) or self.outcome_scale <= 0:
             raise ReadoutError("outcome_scale must be positive")
-        self.config = config.validate()
         self.latent_dim = int(sum(int(v) for v in model.params["z_dims"]))
-        self._expected_f_hash = sha256_weights(model.f_net)
 
-    @property
-    def outcome_hash(self) -> str:
-        return self._expected_f_hash
-
-    def assert_runtime_identity(self) -> None:
-        if sha256_weights(self.model.f_net) != self._expected_f_hash:
-            raise ReadoutError("outcome network state changed during readout")
-
-    @property
-    def _probabilities(self) -> np.ndarray:
+    @staticmethod
+    def _probabilities() -> np.ndarray:
         bounds = []
-        for level in self.config.levels:
+        for level in LEVELS:
             alpha = (1.0 - float(level)) / 2.0
             bounds.extend([alpha, 1.0 - alpha])
         return np.asarray(bounds, np.float64)
@@ -244,34 +155,26 @@ class FullGridReadout:
             raise ReadoutError("latent dimension does not match the model")
         if not np.all(np.isfinite(latent)):
             raise ReadoutError("latent draws must be finite")
+        query_chunk = int(QUERY_CHUNK)
+        draw_chunk = int(DRAW_CHUNK)
         t_size, c_size, u_size, d_size = latent.shape
-        if c_size < 2:
-            raise ReadoutError("chain sensitivity requires at least two chains")
         flat = latent.reshape(t_size * c_size, u_size, d_size)
         num_components = int(flat.shape[0])
-        plugin_sse = 0.0
-        penalty_sum = 0.0
-        coverage_sum = {float(level): 0.0 for level in self.config.levels}
-        width_sum = {float(level): 0.0 for level in self.config.levels}
-        component_seconds = 0.0
-        quantile_seconds = 0.0
-        probabilities = self._probabilities
-        self.assert_runtime_identity()
+        coverage_sum = {float(level): 0.0 for level in LEVELS}
+        width_sum = {float(level): 0.0 for level in LEVELS}
+        probabilities = self._probabilities()
 
-        for q_start in range(0, self.table.num_queries, self.config.query_chunk):
-            q_stop = min(q_start + self.config.query_chunk, self.table.num_queries)
+        for q_start in range(0, self.table.num_queries, query_chunk):
+            q_stop = min(q_start + query_chunk, self.table.num_queries)
             inverse = self.table.query_inverse[q_start:q_stop]
             query_x = self.table.query_x[q_start:q_stop, 0]
             truth = self.truth[q_start:q_stop]
             width = q_stop - q_start
             means = np.empty((width, num_components), np.float64)
             sds = np.empty((width, num_components), np.float64)
-            chain_sums = np.zeros((c_size, width), np.float64)
-            local_counts = np.zeros(c_size, np.int64)
 
-            started = time.perf_counter()
-            for d_start in range(0, num_components, self.config.draw_chunk):
-                d_stop = min(d_start + self.config.draw_chunk, num_components)
+            for d_start in range(0, num_components, draw_chunk):
+                d_stop = min(d_start + draw_chunk, num_components)
                 block = flat[d_start:d_stop]
                 rows = block[:, inverse, :]
                 block_size = d_stop - d_start
@@ -305,77 +208,42 @@ class FullGridReadout:
                     raise ReadoutError("predictive mixture components are invalid")
                 means[:, d_start:d_stop] = mean_block.T
                 sds[:, d_start:d_stop] = sd_block.T
-                chain_index = np.arange(d_start, d_stop, dtype=np.int64) % c_size
-                for chain in range(c_size):
-                    mask = chain_index == chain
-                    chain_sums[chain] += mean_block[mask].sum(axis=0)
-                    local_counts[chain] += int(np.sum(mask))
-            component_seconds += time.perf_counter() - started
-            if np.any(local_counts != t_size):
-                raise ReadoutError("pooled draw order did not preserve chain counts")
-            chain_means = chain_sums / local_counts[:, None]
-            pooled_mean = chain_means.mean(axis=0)
-            residual = pooled_mean - truth
-            plugin_sse += float(np.sum(residual**2))
-            penalty_sum += float(
-                np.sum(np.var(chain_means, axis=0, ddof=1) / c_size)
-            )
 
-            started = time.perf_counter()
             quantiles = gaussian_mixture_quantiles(
                 means,
                 sds,
                 probabilities,
-                iterations=self.config.bisection_iterations,
+                iterations=int(BISECTION_ITERATIONS),
             )
-            quantile_seconds += time.perf_counter() - started
-            for index, level in enumerate(self.config.levels):
+            for index, level in enumerate(LEVELS):
                 lo = quantiles[:, 2 * index]
                 hi = quantiles[:, 2 * index + 1]
                 coverage = ndtr(
-                    (hi - truth) / float(self.config.truth_noise_sd)
-                ) - ndtr((lo - truth) / float(self.config.truth_noise_sd))
+                    (hi - truth) / float(TRUTH_NOISE_SD)
+                ) - ndtr((lo - truth) / float(TRUTH_NOISE_SD))
                 coverage_sum[float(level)] += float(np.sum(coverage))
                 width_sum[float(level)] += float(np.sum(hi - lo))
 
-        self.assert_runtime_identity()
         num_queries = float(self.table.num_queries)
-        plugin_mse = float(plugin_sse / num_queries)
-        penalty = float(penalty_sum / num_queries)
         return {
             "schema_version": "bgm-mcmc-full-grid-readout",
-            "config": self.config.to_payload(),
             "num_targets": int(self.table.num_targets),
             "num_queries": int(self.table.num_queries),
             "num_chains": int(c_size),
             "draws_per_chain": int(t_size),
             "num_components": int(num_components),
-            "structural_mse_plugin": plugin_mse,
-            "sensitivity": {
-                "chain_mean_variance_penalty": penalty,
-                "penalty_fraction_of_plugin": (
-                    None if plugin_mse == 0.0 else float(penalty / plugin_mse)
-                ),
-            },
             "coverage": {
                 str(float(level)): float(coverage_sum[float(level)] / num_queries)
-                for level in self.config.levels
+                for level in LEVELS
             },
-            "width50": float(width_sum[0.5] / num_queries),
-            "width80": float(width_sum[0.8] / num_queries),
+            "width90": float(width_sum[0.9] / num_queries),
             "width95": float(width_sum[0.95] / num_queries),
-            "timings": {
-                "component_seconds": float(component_seconds),
-                "quantile_seconds": float(quantile_seconds),
-                "total_seconds": float(component_seconds + quantile_seconds),
-            },
-            "outcome_hash": self.outcome_hash,
+            "width99": float(width_sum[0.99] / num_queries),
         }
 
 
 __all__ = [
     "FullGridReadout",
-    "ReadoutConfig",
     "ReadoutError",
     "StructuralQueryTable",
     "build_query_table",

@@ -2,27 +2,21 @@ import tensorflow as tf
 
 
 class DemandImageFeatureExtractor(tf.keras.Model):
-    """Extract features from `(time, flattened MNIST image, optional noise)`."""
-
     def __init__(
         self,
         v_dim=785,
         num_dense_features=1,
         image_feature_dim=64,
-        noise_feature_dim=32,
         filters=64,
         name="demand_image_feature_extractor",
     ):
         super().__init__(name=name)
         self.v_dim = int(v_dim)
-        if self.v_dim < 785:
-            raise ValueError("DemandImageFeatureExtractor requires `v_dim >= 785`.")
         self.num_dense_features = int(num_dense_features)
         self.image_feature_dim = int(image_feature_dim)
         self.image_dim = 28 * 28
-        self.extra_noise_dim = self.v_dim - self.num_dense_features - self.image_dim
-        if self.extra_noise_dim < 0:
-            raise ValueError("`v_dim` is too small for `(time, image)` covariates.")
+        if self.v_dim != self.num_dense_features + self.image_dim:
+            raise ValueError("DemandImageFeatureExtractor expects `(time, image)` covariates.")
 
         self.conv1 = tf.keras.layers.Conv2D(filters, 3, padding="valid", use_bias=False)
         self.conv2 = tf.keras.layers.Conv2D(filters, 3, padding="valid", use_bias=False)
@@ -32,11 +26,6 @@ class DemandImageFeatureExtractor(tf.keras.Model):
         self.flatten = tf.keras.layers.Flatten()
         self.linear1 = tf.keras.layers.Dense(128)
         self.linear2 = tf.keras.layers.Dense(self.image_feature_dim)
-        self.noise_hidden = None
-        self.noise_output = None
-        if self.extra_noise_dim > 0:
-            self.noise_hidden = tf.keras.layers.Dense(64)
-            self.noise_output = tf.keras.layers.Dense(int(noise_feature_dim))
 
     @staticmethod
     def normalize_image_pixels(image_flat):
@@ -58,25 +47,16 @@ class DemandImageFeatureExtractor(tf.keras.Model):
             training=training,
         )
         image_feature = self.linear2(image_feature)
-        features = [dense_feature, image_feature]
-        if self.extra_noise_dim > 0:
-            noise_feature = tf.cast(data[:, image_end:], tf.float32)
-            noise_feature = tf.nn.leaky_relu(self.noise_hidden(noise_feature), alpha=0.2)
-            noise_feature = self.noise_output(noise_feature)
-            features.append(noise_feature)
-        return tf.concat(features, axis=1)
+        return tf.concat([dense_feature, image_feature], axis=1)
 
 
 class DemandImageEncoder(tf.keras.Model):
-    """Encode `(time, image)` covariates into latent variables."""
-
     def __init__(
         self,
         z_dim,
         v_dim=785,
         nb_units=(128, 64),
         image_feature_dim=64,
-        noise_feature_dim=32,
         name="demand_image_encoder",
     ):
         super().__init__(name=name)
@@ -85,7 +65,6 @@ class DemandImageEncoder(tf.keras.Model):
             v_dim=self.v_dim,
             num_dense_features=1,
             image_feature_dim=image_feature_dim,
-            noise_feature_dim=noise_feature_dim,
             name=f"{name}_feature_extractor",
         )
         self.hidden_layers = [tf.keras.layers.Dense(int(units)) for units in nb_units]
@@ -99,8 +78,6 @@ class DemandImageEncoder(tf.keras.Model):
 
 
 class DemandImageCovariateDecoder(tf.keras.Model):
-    """Decode latent variables into `(time, image)` covariates."""
-
     def __init__(
         self,
         z_dim,
@@ -111,9 +88,8 @@ class DemandImageCovariateDecoder(tf.keras.Model):
         super().__init__(name=name)
         self.v_dim = int(v_dim)
         self.image_dim = 28 * 28
-        if self.v_dim < 1 + self.image_dim:
-            raise ValueError("DemandImageCovariateDecoder requires `v_dim >= 785`.")
-        self.extra_noise_dim = self.v_dim - 1 - self.image_dim
+        if self.v_dim != 1 + self.image_dim:
+            raise ValueError("DemandImageCovariateDecoder requires `v_dim == 785`.")
         self.time_hidden = tf.keras.layers.Dense(64)
         self.time_mean_head = tf.keras.layers.Dense(1)
         self.time_var_head = tf.keras.layers.Dense(1)
@@ -140,13 +116,6 @@ class DemandImageCovariateDecoder(tf.keras.Model):
             ]
         )
         self.image_logits_head = tf.keras.layers.Conv2D(1, 1, padding="same", name="image_logits")
-        self.noise_hidden = None
-        self.noise_mean_head = None
-        self.noise_var_head = None
-        if self.extra_noise_dim > 0:
-            self.noise_hidden = tf.keras.layers.Dense(64)
-            self.noise_mean_head = tf.keras.layers.Dense(self.extra_noise_dim)
-            self.noise_var_head = tf.keras.layers.Dense(self.extra_noise_dim)
 
     def call(self, data_z, training=True):
         time_hidden = tf.nn.leaky_relu(self.time_hidden(data_z), alpha=0.2)
@@ -159,22 +128,12 @@ class DemandImageCovariateDecoder(tf.keras.Model):
         image_probs = tf.nn.sigmoid(image_logits)
         image_logits_flat = tf.reshape(image_logits, (-1, self.image_dim))
         image_probs_flat = tf.reshape(image_probs, (-1, self.image_dim))
-        if self.extra_noise_dim > 0:
-            noise_hidden = tf.nn.leaky_relu(self.noise_hidden(data_z), alpha=0.2)
-            noise_mean = self.noise_mean_head(noise_hidden)
-            noise_var = tf.nn.softplus(self.noise_var_head(noise_hidden)) + 1e-6
-        else:
-            batch_size = tf.shape(data_z)[0]
-            noise_mean = tf.zeros((batch_size, 0), dtype=tf.float32)
-            noise_var = tf.zeros((batch_size, 0), dtype=tf.float32)
-        public_v = tf.concat([time_mean, image_probs_flat * 255.0, noise_mean], axis=1)
+        public_v = tf.concat([time_mean, image_probs_flat * 255.0], axis=1)
 
         return {
             "time_mean": time_mean,
             "time_var": time_var,
             "image_logits": image_logits_flat,
             "image_probs": image_probs_flat,
-            "noise_mean": noise_mean,
-            "noise_var": noise_var,
             "public_v": public_v,
         }

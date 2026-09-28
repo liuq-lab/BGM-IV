@@ -1,8 +1,5 @@
-"""Atomic MCMC production-draw artifact tests."""
-
 from __future__ import annotations
 
-import hashlib
 import json
 
 import numpy as np
@@ -14,51 +11,49 @@ from bgm_iv.mcmc.artifact import (
     save_draw_artifact,
 )
 
+GRID = {
+    "query_x": np.array([[0.1], [0.2]], np.float32),
+    "truth": np.array([1.0, 2.0], np.float64),
+}
 
-def test_draw_artifact_roundtrip_and_hash(tmp_path):
+
+def test_draw_artifact_roundtrip(tmp_path):
     draws = np.arange(5 * 4 * 3 * 2, dtype=np.float32).reshape(5, 4, 3, 2)
     artifact = save_draw_artifact(
         draws,
         artifact_root=tmp_path,
         arm_id="w2000-d5000",
-        provenance={"checkpoint_identity": "checkpoint", "seed": 17},
+        settings={"family": "demand", "seeds": {"pilot": 1, "production": 2}},
+        grid=GRID,
     )
 
     loaded = np.load(artifact["draws_path"], allow_pickle=False)
     np.testing.assert_array_equal(loaded, draws)
-    with open(artifact["draws_path"], "rb") as handle:
-        assert hashlib.sha256(handle.read()).hexdigest() == artifact["draw_sha256"]
     with open(artifact["manifest_path"], encoding="utf-8") as handle:
         manifest = json.load(handle)
     assert manifest["draw_shape"] == [5, 4, 3, 2]
     assert manifest["draw_dtype"] == "float32"
-    assert manifest["draw_sha256"] == artifact["draw_sha256"]
+    assert manifest["settings"]["seeds"] == {"pilot": 1, "production": 2}
     assert not list(tmp_path.glob(".*.staging-*"))
 
-    mapped, verified = load_draw_artifact(artifact["manifest_path"])
+    mapped, grid, restored = load_draw_artifact(artifact["manifest_path"])
     assert isinstance(mapped, np.memmap)
     np.testing.assert_array_equal(mapped, draws)
-    assert verified["verified"] is True
-    assert verified["manifest_sha256"] == artifact["manifest_sha256"]
+    assert set(grid) == set(GRID)
+    for key, value in GRID.items():
+        np.testing.assert_array_equal(grid[key], value)
+        assert grid[key].dtype == value.dtype
+    assert restored["settings"]["family"] == "demand"
 
 
 def test_draw_artifact_refuses_overwrite_and_unsafe_arm(tmp_path):
     draws = np.ones((2, 4, 1, 1), np.float32)
-    kwargs = {
-        "artifact_root": tmp_path,
-        "arm_id": "arm",
-        "provenance": {"checkpoint_identity": "checkpoint"},
-    }
+    kwargs = {"artifact_root": tmp_path, "arm_id": "arm", "settings": {}, "grid": GRID}
     save_draw_artifact(draws, **kwargs)
     with pytest.raises(MCMCDrawArtifactError, match="overwrite"):
         save_draw_artifact(draws, **kwargs)
     with pytest.raises(MCMCDrawArtifactError, match="arm_id"):
-        save_draw_artifact(
-            draws,
-            artifact_root=tmp_path,
-            arm_id="../escape",
-            provenance={},
-        )
+        save_draw_artifact(draws, **{**kwargs, "arm_id": "../escape"})
 
 
 @pytest.mark.parametrize(
@@ -72,20 +67,14 @@ def test_draw_artifact_refuses_overwrite_and_unsafe_arm(tmp_path):
 def test_draw_artifact_rejects_invalid_tensor(tmp_path, draws, message):
     with pytest.raises(MCMCDrawArtifactError, match=message):
         save_draw_artifact(
-            draws,
-            artifact_root=tmp_path,
-            arm_id="arm",
-            provenance={},
+            draws, artifact_root=tmp_path, arm_id="arm", settings={}, grid=GRID
         )
 
 
-def test_draw_artifact_loader_rejects_manifest_and_draw_corruption(tmp_path):
+def test_draw_artifact_loader_rejects_inconsistent_or_missing_files(tmp_path):
     draws = np.ones((2, 4, 1, 1), np.float32)
     first = save_draw_artifact(
-        draws,
-        artifact_root=tmp_path,
-        arm_id="manifest-corruption",
-        provenance={"checkpoint_identity": "checkpoint"},
+        draws, artifact_root=tmp_path, arm_id="shape", settings={}, grid=GRID
     )
     with open(first["manifest_path"], "r+", encoding="utf-8") as handle:
         manifest = json.load(handle)
@@ -93,19 +82,15 @@ def test_draw_artifact_loader_rejects_manifest_and_draw_corruption(tmp_path):
         handle.seek(0)
         json.dump(manifest, handle)
         handle.truncate()
-    with pytest.raises(MCMCDrawArtifactError, match="manifest hash mismatch"):
+    with pytest.raises(MCMCDrawArtifactError, match="shape mismatch"):
         load_draw_artifact(first["manifest_path"])
 
     second = save_draw_artifact(
-        draws,
-        artifact_root=tmp_path,
-        arm_id="draw-corruption",
-        provenance={"checkpoint_identity": "checkpoint"},
+        draws, artifact_root=tmp_path, arm_id="missing", settings={}, grid=GRID
     )
-    with open(second["draws_path"], "r+b") as handle:
-        handle.seek(-1, 2)
-        byte = handle.read(1)
-        handle.seek(-1, 2)
-        handle.write(bytes([byte[0] ^ 1]))
-    with pytest.raises(MCMCDrawArtifactError, match="SHA-256 mismatch"):
+    (tmp_path / "missing" / "grid.npz").unlink()
+    with pytest.raises(MCMCDrawArtifactError, match="missing"):
         load_draw_artifact(second["manifest_path"])
+
+    with pytest.raises(MCMCDrawArtifactError, match="does not exist"):
+        load_draw_artifact(tmp_path / "nowhere" / "manifest.json")

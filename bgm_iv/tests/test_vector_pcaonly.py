@@ -1,4 +1,3 @@
-"""PCA-only entrypoint, representation and real result-writer contracts."""
 import csv
 import json
 from pathlib import Path
@@ -22,22 +21,31 @@ def params(k=6):
 
 
 def test_pcaonly_registration_and_explicit_config():
-    assert m._MODEL_CLASS_BY_DATASET[NAME] is m.BGM_IV
-    assert m._MCMC_FAMILY_BY_DATASET[NAME] == "demand"
-    assert m._select_demand_design_single_run_fn(NAME) is m._run_single_demand_design_vector_pcaonly_iv
-    p = params("none")
-    assert p["pca_dim"] is None and p["proxy_transform"] == "none"
-    assert (p["v_dim"], p["vector_dim"]) == (785, 784)
+    assert m._DATASETS[NAME] == ("_run_single_demand_design_vector_pcaonly_iv", m.BGM_IV, "demand")
+    assert m._model_class({"dataset": NAME}) is m.BGM_IV
+    assert m._single_run_fn({"dataset": NAME}) is m._run_single_demand_design_vector_pcaonly_iv
+    p = params(6)
+    assert p["pca_dim"] == 6
+    assert (p["v_dim"], p["w_dim"]) == (785, 1)
     for bad, match in (({"dataset": NAME}, "pca_dim"),
-                       ({"dataset": NAME, "pca_dim": 6, "proxy_transform": "pca6"}, "use pca_dim")):
+                       ({"dataset": NAME, "pca_dim": "none"}, "1..784"),
+                       ({"dataset": NAME, "pca_dim": [1, 2]}, "scalar pca_dim")):
         with pytest.raises(ValueError, match=match):
             m._apply_demand_design_benchmark_defaults(bad)
 
 
-@pytest.mark.parametrize("value", [True, False, 0, -1, 785, 6.0, "bad", [6]])
+@pytest.mark.parametrize(
+    "value", [True, False, 0, -1, 785, 6.0, 6.7, "6", "bad", [6], None, "none", ""]
+)
 def test_pcaonly_rejects_bad_dimension(value):
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="1..784"):
         parse_pca_dim(value)
+
+
+@pytest.mark.parametrize("value", [1, 128, 784, np.int64(8)])
+def test_pcaonly_accepts_integer_dimensions(value):
+    assert parse_pca_dim(value) == int(value)
+    assert type(parse_pca_dim(value)) is int
 
 
 def test_pcaonly_standardizer_is_demand_at_one_component_and_preserves_other_data():
@@ -58,15 +66,14 @@ def test_pcaonly_standardizer_is_demand_at_one_component_and_preserves_other_dat
 def test_proxy_block_has_one_shared_scale():
     d = m.simulate_demand_design_vector_iv(n_samples=64, rho=0.5, seed=3)
     d = m._apply_proxy_arm(d, fit_pca(d["v"][:, 1:], 6))
-    stats = m._standardize_demand_design_pcaonly_data(d)[2]
+    stats = m._standardize_demand_design_pcaonly_data(d, d)[2]
     assert np.unique(stats["v"]["scale"][:, 1:]).size == 1
     expected = np.sqrt(np.mean(np.square(np.std(d["v"][:, 1:], axis=0))))
     np.testing.assert_allclose(stats["v"]["scale"][:, 1:], expected, rtol=1e-5)
 
 
-@pytest.mark.parametrize("k", [1, 6, None])
-@pytest.mark.parametrize("writer", ["serial", "parallel"])
-def test_runner_narrows_locally_and_persists_fitted_provenance(monkeypatch, tmp_path, k, writer):
+@pytest.mark.parametrize("k", [1, 6])
+def test_runner_narrows_locally_and_persists_pca_dim(monkeypatch, tmp_path, k):
     p = params(k)
     captured = {}
 
@@ -75,43 +82,25 @@ def test_runner_narrows_locally_and_persists_fitted_provenance(monkeypatch, tmp_
         return object()
 
     def finalize(model_params, model, **kwargs):
-        prov = dict(kwargs["extra_provenance"], params=dict(model_params), checkpoint_timestamp="test")
-        return {"provenance": prov, "training_history": [],
-                "run_config_text": kwargs["run_config_text"], "ranges_text": kwargs["ranges_text"],
-                "final_results": {"map": 1.0, "encoder": 2.0}}
+        return {"provenance": {"checkpoint_timestamp": "test"},
+                "run_config_text": kwargs["run_config_text"],
+                "final_results": {"map": 1.0}}
 
     monkeypatch.setattr(m, "_fit_or_restore_demand_design_model", fit)
     monkeypatch.setattr(m, "_finalize_demand_design_run", finalize)
     result = m._run_single_demand_design_vector_pcaonly_iv(p)
-    width = 784 if k is None else k
+    width = k
     assert captured["data"]["v"].shape == (200, width+1)
     assert captured["params"]["v_dim"] == width+1
-    assert p["v_dim"] == 785 and p["vector_dim"] == 784
+    assert p["v_dim"] == 785
     assert captured["criterion"]["y_raw"].shape == (200, 1)
-    assert result["provenance"]["model_v_dim"] == width+1
-    if writer == "serial":
-        m._persist_demand_design_repeat_outputs(
-            tmp_path, 1, 1, p, result["run_config_text"], result["ranges_text"], [],
-            final_results=result["final_results"], provenance=result["provenance"])
-    else:
-        m._flush_completed_demand_design_result(tmp_path, {
-            "params": p, "run_index": 1, "total_runs": 1,
-            "repeat_outputs": result, "error": None})
+    assert f"pca_dim: {k}" in result["run_config_text"]
+    m._persist_demand_design_repeat_outputs(tmp_path, p, result)
     csv_path = next(tmp_path.rglob("results.csv"))
     row = list(csv.DictReader(csv_path.open()))[0]
-    for key in ("proxy_transform", "pca_fit_sha1", "train_proxy_sha1",
-                "test_pca_sha1_r4", "vector_pca_version"):
-        assert row[key] == str(result["provenance"][key]) and row[key]
-    assert row["pca_dim"] == ("" if k is None else str(k))
-    record = json.loads(next(tmp_path.rglob("repeat0_test.json")).read_text())
-    assert record["provenance"]["model_vector_dim"] == width
-    identity = m._manifest_params(captured["params"])
-    changed = dict(captured["params"], vector_pca_version="different-version")
-    assert m._manifest_params(changed) != identity
-
-
-def test_pcaonly_rejects_raw_training():
-    p = params(6)
-    p["normalize_before_training"] = False
-    with pytest.raises(ValueError, match="normalize_before_training"):
-        m._run_single_demand_design_vector_pcaonly_iv(p)
+    assert row["pca_dim"] == str(k)
+    assert json.loads(next(tmp_path.rglob("repeat0_test.json")).read_text())
+    trained = m._training_params(captured["params"])
+    assert trained["pca_dim"] == k and trained["v_dim"] == width + 1
+    changed = dict(captured["params"], pca_dim=k + 1)
+    assert m._training_params(changed) != trained

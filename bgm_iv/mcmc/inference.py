@@ -1,18 +1,10 @@
-"""Full-grid ungated structural MCMC inference.
-
-Each family runs one all-target pilot, one all-target production chain set and
-one all-draw query-level readout.  Statistical reportability gates are
-deliberately absent; malformed targets or non-finite retained states still
-fail the complete run.
-"""
-
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
-import hashlib
+import json
 import platform
 import socket
 import time
+from pathlib import Path
 from typing import Any, Callable, Mapping, Optional, Sequence
 
 import numpy as np
@@ -20,152 +12,68 @@ import tensorflow as tf
 
 from .artifact import (
     MCMCDrawArtifactError,
+    _validate_arm_id,
     load_draw_artifact,
     save_draw_artifact,
 )
-from .readout import FullGridReadout, ReadoutConfig, build_query_table
+from .readout import TRUTH_NOISE_SD, FullGridReadout, build_query_table
 from .sampler import (
-    FrozenBatch,
     FrozenVectorizedHMC,
     LatentPosteriorEvaluator,
-    MassRegularization,
-    ProductionConfig,
-    TrajectoryPolicy,
-    WarmupConfig,
     overdispersed_initial_state,
     regularize_state_variance,
 )
-from .target import AffinePreprocessorSpec, resolve_target, sha256_array, sha256_json
+from .target import _model_family
 
 
 class MCMCInferenceError(RuntimeError):
-    """A full-grid MCMC inference contract violation."""
+    pass
 
 
-@dataclass(frozen=True)
-class MCMCConfig:
-    num_chains: int = 4
-    warmup_steps: int = 600
-    segment_size: int = 600
-    initial_step_size: float = 0.1
-    num_leapfrog_steps: int = 5
-    target_accept_prob: float = 0.8
-    trajectory_support: Sequence[int] = (3, 5, 7)
-    overdispersion_scale: float = 2.0
-
-    def validate(self) -> "MCMCConfig":
-        support = tuple(int(value) for value in self.trajectory_support)
-        if int(self.num_chains) < 4:
-            raise MCMCInferenceError("production recipes require at least four chains")
-        if int(self.warmup_steps) < 1 or int(self.segment_size) < 1:
-            raise MCMCInferenceError("warmup and retained draw counts must be positive")
-        if not support or len(support) != len(set(support)) or min(support) < 1:
-            raise MCMCInferenceError("trajectory_support must be unique and positive")
-        if int(self.num_leapfrog_steps) < 1:
-            raise MCMCInferenceError("num_leapfrog_steps must be positive")
-        if not np.isfinite(self.initial_step_size) or self.initial_step_size <= 0:
-            raise MCMCInferenceError("initial_step_size must be positive")
-        if not 0.0 < float(self.target_accept_prob) < 1.0:
-            raise MCMCInferenceError("target_accept_prob must lie in (0,1)")
-        if not np.isfinite(self.overdispersion_scale) or self.overdispersion_scale <= 0:
-            raise MCMCInferenceError("overdispersion_scale must be positive")
-        return self
-
-    def to_payload(self) -> dict[str, Any]:
-        return {
-            "num_chains": int(self.num_chains),
-            "warmup_steps": int(self.warmup_steps),
-            "segment_size": int(self.segment_size),
-            "initial_step_size": float(self.initial_step_size),
-            "num_leapfrog_steps": int(self.num_leapfrog_steps),
-            "target_accept_prob": float(self.target_accept_prob),
-            "trajectory_support": [int(v) for v in self.trajectory_support],
-            "overdispersion_scale": float(self.overdispersion_scale),
-        }
-
-
-@dataclass(frozen=True)
-class FamilyRecipe:
-    name: str
-    target_kind: str
-    production: MCMCConfig
-    pilot_warmup_steps: int = 400
-    pilot_initial_step_size: float = 0.02
-    pilot_leapfrog_steps: int = 5
-    pilot_segment_size: int = 240
-    pilot_trajectory_support: Sequence[int] = (3, 5, 7)
-    pilot_jitter_scale: float = 0.3
-    mass_regularization: MassRegularization = MassRegularization()
-    readout: ReadoutConfig = ReadoutConfig()
-
-    def validate(self) -> "FamilyRecipe":
-        if self.target_kind not in {"model_posterior", "generalized_gibbs"}:
-            raise MCMCInferenceError("unknown target_kind")
-        if int(self.pilot_warmup_steps) < 1 or int(self.pilot_segment_size) < 2:
-            raise MCMCInferenceError("pilot lengths must be positive")
-        self.production.validate()
-        self.mass_regularization.validate()
-        self.readout.validate()
-        return self
-
-    def to_payload(self) -> dict[str, Any]:
-        return {
-            "name": self.name,
-            "target_kind": self.target_kind,
-            "pilot": {
-                "warmup_steps": int(self.pilot_warmup_steps),
-                "initial_step_size": float(self.pilot_initial_step_size),
-                "num_leapfrog_steps": int(self.pilot_leapfrog_steps),
-                "segment_size": int(self.pilot_segment_size),
-                "trajectory_support": [int(v) for v in self.pilot_trajectory_support],
-                "jitter_scale": float(self.pilot_jitter_scale),
-                "mass_estimator": "per_chain_within_variance_mean_over_chains_ddof1",
-            },
-            "production": self.production.to_payload(),
-            "readout": self.readout.to_payload(),
-        }
-
-    @property
-    def recipe_hash(self) -> str:
-        return sha256_json("mcmc-inference-recipe", self.to_payload())
-
-
-_VECTOR_PRODUCTION = MCMCConfig(
-    num_chains=4,
-    warmup_steps=1600,
-    segment_size=24000,
-    initial_step_size=0.02,
-    num_leapfrog_steps=31,
-    target_accept_prob=0.90,
-    trajectory_support=(7, 15, 31),
-    overdispersion_scale=2.0,
-)
-
-FAMILY_RECIPES: dict[str, FamilyRecipe] = {
-    "demand": FamilyRecipe(
-        name="demand",
-        target_kind="model_posterior",
-        pilot_initial_step_size=0.05,
-        production=replace(
-            _VECTOR_PRODUCTION,
-            warmup_steps=800,
-            segment_size=12000,
-            initial_step_size=0.05,
-            num_leapfrog_steps=5,
-            trajectory_support=(3, 5, 7),
-        ),
-    ),
-    "vector": FamilyRecipe(
-        name="vector",
-        target_kind="model_posterior",
-        production=_VECTOR_PRODUCTION,
-    ),
-    "mnist_pixel": FamilyRecipe(
-        name="mnist_pixel",
-        target_kind="generalized_gibbs",
-        production=_VECTOR_PRODUCTION,
-    ),
+FAMILY_RECIPES: dict[str, tuple[float, int, tuple[int, ...]]] = {
+    "demand": (0.05, 5, (3, 5, 7)),
+    "mnist_pixel": (0.02, 31, (7, 15, 31)),
 }
+
+
+def _positive_int(name: str, value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, np.integer)) or value < 1:
+        raise MCMCInferenceError(f"{name} must be a positive integer")
+    return int(value)
+
+
+def _recipe(
+    family: str, *, num_chains: int, warmup_steps: int, draws: int
+) -> dict[str, Any]:
+    try:
+        step_size, leapfrog_steps, support = FAMILY_RECIPES[str(family)]
+    except KeyError:
+        raise MCMCInferenceError(f"unknown MCMC family {family!r}") from None
+    num_chains = _positive_int("production_num_chains", num_chains)
+    if num_chains < 4:
+        raise MCMCInferenceError("production recipes require at least four chains")
+    return {
+        "name": str(family),
+        "pilot": {
+            "warmup_steps": 400,
+            "initial_step_size": float(step_size),
+            "num_leapfrog_steps": 5,
+            "segment_size": 240,
+            "trajectory_support": [3, 5, 7],
+            "jitter_scale": 0.3,
+            "mass_estimator": "per_chain_within_variance_mean_over_chains_ddof1",
+        },
+        "production": {
+            "num_chains": num_chains,
+            "warmup_steps": _positive_int("production_warmup_steps", warmup_steps),
+            "segment_size": _positive_int("production_draws", draws),
+            "initial_step_size": float(step_size),
+            "num_leapfrog_steps": int(leapfrog_steps),
+            "target_accept_prob": 0.9,
+            "trajectory_support": [int(value) for value in support],
+            "overdispersion_scale": 2.0,
+        },
+    }
 
 
 def execution_environment() -> dict[str, Any]:
@@ -173,7 +81,7 @@ def execution_environment() -> dict[str, Any]:
     for gpu in tf.config.list_physical_devices("GPU"):
         try:
             details = tf.config.experimental.get_device_details(gpu)
-        except Exception:  # pragma: no cover - device dependent
+        except Exception:
             details = {}
         capability = details.get("compute_capability")
         gpus.append(
@@ -186,7 +94,7 @@ def execution_environment() -> dict[str, Any]:
         )
     try:
         build = dict(tf.sysconfig.get_build_info())
-    except Exception:  # pragma: no cover - build dependent
+    except Exception:
         build = {}
     return {
         "hostname": socket.gethostname(),
@@ -199,23 +107,14 @@ def execution_environment() -> dict[str, Any]:
     }
 
 
-def derive_mcmc_seeds(
-    family: str, data_seed: int, checkpoint_identity: str
-) -> dict[str, int]:
-    def derive(stage: str) -> int:
-        digest = hashlib.sha256(
-            f"bgm-mcmc-seed\0{family}\0{int(data_seed)}\0"
-            f"{checkpoint_identity}\0{stage}".encode()
-        ).digest()
-        return int.from_bytes(digest[:4], "little") % (2**31 - 1)
-
-    return {"pilot": derive("pilot"), "production": derive("production")}
+_RECIPE_BY_MODEL_FAMILY = {"demand": "demand", "mnist": "mnist_pixel"}
 
 
-def _make_runner(
-    resolved: Any,
+def _sample(
+    model: Any,
+    context: np.ndarray,
     *,
-    num_targets: int,
+    run_seed: int,
     num_chains: int,
     warmup_steps: int,
     initial_step_size: float,
@@ -223,193 +122,62 @@ def _make_runner(
     target_accept_prob: float,
     segment_size: int,
     trajectory_support: Sequence[int],
-) -> FrozenVectorizedHMC:
-    return FrozenVectorizedHMC(
-        evaluator=LatentPosteriorEvaluator(resolved),
-        allow_unverified_evaluator=False,
+    jitter_scale: float,
+    variance: np.ndarray,
+    label: str,
+    progress: Optional[Callable[[str], None]],
+) -> tuple[np.ndarray, np.ndarray]:
+    runner = FrozenVectorizedHMC(
+        evaluator=LatentPosteriorEvaluator(model),
         num_chains=int(num_chains),
-        max_batch_size=int(num_targets),
-        warmup_config=WarmupConfig(
-            warmup_steps=int(warmup_steps),
-            initial_step_size=float(initial_step_size),
-            num_leapfrog_steps=int(num_leapfrog_steps),
-            target_accept_prob=float(target_accept_prob),
-        ),
-        production_config=ProductionConfig(
-            segment_size=int(segment_size),
-            trajectory_policy=TrajectoryPolicy(
-                tuple(int(value) for value in trajectory_support)
-            ),
-        ),
+        num_targets=int(context.shape[0]),
+        warmup_steps=int(warmup_steps),
+        initial_step_size=float(initial_step_size),
+        num_leapfrog_steps=int(num_leapfrog_steps),
+        target_accept_prob=float(target_accept_prob),
+        segment_size=int(segment_size),
+        trajectory_support=tuple(int(value) for value in trajectory_support),
     )
-
-
-def estimate_pilot_state_variance(
-    model: Any,
-    resolved: Any,
-    table: Any,
-    recipe: FamilyRecipe,
-    *,
-    run_seed: int,
-    run_label: str,
-    progress: Optional[Callable[[str], None]] = print,
-) -> tuple[np.ndarray, dict[str, Any]]:
-    """One all-target pilot followed by diagonal-mass regularization."""
-
-    started = time.time()
-    latent_dim = int(sum(int(value) for value in model.params["z_dims"]))
-    runner = _make_runner(
-        resolved,
-        num_targets=table.num_targets,
-        num_chains=4,
-        warmup_steps=recipe.pilot_warmup_steps,
-        initial_step_size=recipe.pilot_initial_step_size,
-        num_leapfrog_steps=recipe.pilot_leapfrog_steps,
-        target_accept_prob=0.9,
-        segment_size=recipe.pilot_segment_size,
-        trajectory_support=recipe.pilot_trajectory_support,
-    )
-    ids = tuple(range(table.num_targets))
-    frozen = FrozenBatch(ids, table.unique_v, batch_index=0)
-    epoch = runner.bind_epoch(
-        frozen,
-        run_seed=int(run_seed),
-        run_key=hashlib.sha256(
-            f"bgm-mcmc-pilot\0{run_label}".encode()
-        ).hexdigest(),
-        production_epoch=0,
-    )
-    identity_variance = np.ones((table.num_targets, latent_dim), np.float32)
+    context = runner.check_target(context)
     initial = overdispersed_initial_state(
         model,
-        frozen.target_context,
-        num_chains=4,
-        latent_dim=latent_dim,
-        scale=float(recipe.pilot_jitter_scale),
-        epoch_identity=epoch.epoch_identity,
-        variance=identity_variance,
-    )
-    warm = runner.warmup(
-        epoch, initial_state=initial, state_variance=identity_variance
-    )
-    segment = runner.run_segment(
-        epoch,
-        segment_index=0,
-        pre_state=warm.final_state,
-        step_size=warm.step_size,
-        state_variance=warm.state_variance,
-    )
-    if progress:
-        per_chain = np.mean(segment.acceptance_rate, axis=1)
-        progress(
-            "[mcmc pilot] acceptance mean="
-            f"{float(np.mean(segment.acceptance_rate)):.3f}, "
-            f"min={float(np.min(segment.acceptance_rate)):.3f}, "
-            f"per-chain={np.round(per_chain, 3).tolist()}"
-        )
-    raw = np.var(segment.draws, axis=0, ddof=1).mean(axis=0)
-    if not np.all(np.isfinite(raw)) or np.any(raw <= 0.0):
-        raise MCMCInferenceError("pilot variance estimate is not positive/finite")
-    regularized = regularize_state_variance(
-        raw, recipe.mass_regularization
-    ).astype(np.float32)
-    return regularized, {
-        "seconds": float(time.time() - started),
-        "raw_variance_median": float(np.median(raw)),
-        "regularized_variance_median": float(np.median(regularized)),
-        "regularized_variance_hash": sha256_array(regularized),
-    }
-
-
-def run_mcmc(
-    model: Any,
-    table: Any,
-    *,
-    preprocessor: AffinePreprocessorSpec,
-    run_seed: int,
-    run_label: str,
-    config: MCMCConfig,
-    state_variance: np.ndarray,
-    progress: Optional[Callable[[str], None]] = print,
-) -> dict[str, Any]:
-    """Run one all-target warmup and production segment."""
-
-    config = config.validate()
-    if bool(model.params.get("use_bnn", False)):
-        raise MCMCInferenceError("stochastic BNN checkpoints have no fixed target")
-    resolved = resolve_target(model, preprocessor, global_power=1.0)
-    if resolved.spec.family == "mnist":
-        expected_kind = "generalized_gibbs"
-    else:
-        expected_kind = "model_posterior"
-    if resolved.spec.target_kind != expected_kind:
-        raise MCMCInferenceError("resolved target kind does not match the model family")
-    runner = _make_runner(
-        resolved,
-        num_targets=table.num_targets,
-        num_chains=config.num_chains,
-        warmup_steps=config.warmup_steps,
-        initial_step_size=config.initial_step_size,
-        num_leapfrog_steps=config.num_leapfrog_steps,
-        target_accept_prob=config.target_accept_prob,
-        segment_size=config.segment_size,
-        trajectory_support=config.trajectory_support,
-    )
-    ids = tuple(range(table.num_targets))
-    frozen = FrozenBatch(ids, table.unique_v, batch_index=0)
-    run_key = hashlib.sha256(
-        ("bgm-mcmc-run\0" + str(run_label)).encode()
-    ).hexdigest()
-    epoch = runner.bind_epoch(
-        frozen,
+        context,
+        num_chains=int(num_chains),
+        latent_dim=runner.latent_dim,
+        scale=float(jitter_scale),
         run_seed=int(run_seed),
-        run_key=run_key,
-        production_epoch=0,
-    )
-    latent_dim = int(sum(int(value) for value in model.params["z_dims"]))
-    variance = np.asarray(state_variance, np.float32)
-    if variance.shape != (table.num_targets, latent_dim):
-        raise MCMCInferenceError("state_variance must cover every target")
-    initial = overdispersed_initial_state(
-        model,
-        frozen.target_context,
-        num_chains=config.num_chains,
-        latent_dim=latent_dim,
-        scale=config.overdispersion_scale,
-        epoch_identity=epoch.epoch_identity,
         variance=variance,
     )
-    started = time.time()
-    warm = runner.warmup(epoch, initial_state=initial, state_variance=variance)
-    segment = runner.run_segment(
-        epoch,
-        segment_index=0,
-        pre_state=warm.final_state,
-        step_size=warm.step_size,
-        state_variance=warm.state_variance,
+    final_state, step = runner.warmup(
+        run_seed=int(run_seed),
+        context=context,
+        initial_state=initial,
+        state_variance=variance,
     )
-    seconds = time.time() - started
+    draws, acceptance = runner.run_segment(
+        run_seed=int(run_seed),
+        context=context,
+        state=final_state,
+        step_size=step,
+        state_variance=variance,
+    )
     if progress:
-        per_chain = np.mean(segment.acceptance_rate, axis=1)
+        per_chain = np.mean(acceptance, axis=1)
         progress(
-            "[mcmc production] acceptance mean="
-            f"{float(np.mean(segment.acceptance_rate)):.3f}, "
-            f"min={float(np.min(segment.acceptance_rate)):.3f}, "
+            f"[mcmc {label}] acceptance mean="
+            f"{float(np.mean(acceptance)):.3f}, "
+            f"min={float(np.min(acceptance)):.3f}, "
             f"per-chain={np.round(per_chain, 3).tolist()}"
         )
-    per_chain = np.mean(segment.acceptance_rate, axis=1)
+    return draws, acceptance
+
+
+def _grid_arrays(table: Any, truth: np.ndarray) -> dict[str, np.ndarray]:
     return {
-        "draws": segment.draws,
-        "seconds": float(seconds),
-        "run_seed": int(run_seed),
-        "run_key": run_key,
-        "target": resolved.spec.manifest,
-        "config": config.to_payload(),
-        "acceptance": {
-            "mean": float(np.mean(segment.acceptance_rate)),
-            "minimum": float(np.min(segment.acceptance_rate)),
-            "per_chain": [float(value) for value in per_chain],
-        },
+        "query_x": np.asarray(table.query_x),
+        "query_inverse": np.asarray(table.query_inverse),
+        "unique_v": np.asarray(table.unique_v),
+        "truth": np.asarray(truth),
     }
 
 
@@ -425,35 +193,29 @@ def run_mcmc_grid(
     outcome_shift: float,
     outcome_scale: float,
     treatment_transform: Mapping[str, float],
-    data_seed: int,
-    checkpoint_identity: str,
-    run_label: str,
-    recipe: Optional[FamilyRecipe] = None,
-    truth_noise_sd: float = 1.0,
-    production_num_chains: Optional[int] = None,
-    production_warmup_steps: Optional[int] = None,
-    production_draws: Optional[int] = None,
+    seeds: Mapping[str, int],
+    production_num_chains: int,
+    production_warmup_steps: int,
+    production_draws: int,
+    source: Optional[Mapping[str, Any]] = None,
     artifact_root: Optional[Any] = None,
     arm_id: Optional[str] = None,
-    readout_prefixes: Optional[Sequence[int]] = None,
     readout_artifact_manifest: Optional[Any] = None,
     progress: Optional[Callable[[str], None]] = print,
 ) -> dict[str, Any]:
-    """Pilot, production and one or more prefix readouts on the query grid.
-
-    The pilot recipe is never changed by the ablation overrides.  If an
-    artifact destination is supplied, the complete production tensor is
-    atomically committed before the first readout starts.
-    """
-
     started = time.time()
-    if recipe is None:
-        try:
-            recipe = FAMILY_RECIPES[str(family)]
-        except KeyError:
-            raise MCMCInferenceError(f"unknown MCMC family {family!r}") from None
-    recipe = recipe.validate()
+    seeds = {"pilot": int(seeds["pilot"]), "production": int(seeds["production"])}
+    source = json.loads(json.dumps(dict(source or {}), sort_keys=True, default=str))
+    recipe = _recipe(
+        family,
+        num_chains=production_num_chains,
+        warmup_steps=production_warmup_steps,
+        draws=production_draws,
+    )
+    pilot_config = recipe["pilot"]
+    config = recipe["production"]
     loaded_draws = None
+    loaded_grid = None
     loaded_artifact = None
     artifact_load_seconds = 0.0
     if readout_artifact_manifest is not None:
@@ -463,77 +225,27 @@ def run_mcmc_grid(
             )
         artifact_load_started = time.time()
         try:
-            loaded_draws, loaded_artifact = load_draw_artifact(
+            loaded_draws, loaded_grid, loaded_artifact = load_draw_artifact(
                 readout_artifact_manifest
             )
         except MCMCDrawArtifactError as exc:
             raise MCMCInferenceError(str(exc)) from exc
         artifact_load_seconds = time.time() - artifact_load_started
-        artifact_provenance = loaded_artifact.get("provenance")
-        if not isinstance(artifact_provenance, Mapping):
-            raise MCMCInferenceError("draw artifact provenance is missing")
-        artifact_config = artifact_provenance.get("production_config")
-        if not isinstance(artifact_config, Mapping):
-            raise MCMCInferenceError("draw artifact production config is missing")
-        if production_warmup_steps is None:
-            production_warmup_steps = artifact_config.get("warmup_steps")
-        if production_draws is None:
-            production_draws = artifact_config.get("segment_size")
-        if production_num_chains is None:
-            production_num_chains = artifact_config.get("num_chains")
-
-    def positive_override(name: str, value: Optional[int], default: int) -> int:
-        if value is None:
-            return int(default)
-        if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
-            raise MCMCInferenceError(f"{name} must be a positive integer")
-        result = int(value)
-        if result < 1:
-            raise MCMCInferenceError(f"{name} must be a positive integer")
-        return result
-
-    effective_production = replace(
-        recipe.production,
-        num_chains=positive_override(
-            "production_num_chains",
-            production_num_chains,
-            recipe.production.num_chains,
-        ),
-        warmup_steps=positive_override(
-            "production_warmup_steps",
-            production_warmup_steps,
-            recipe.production.warmup_steps,
-        ),
-        segment_size=positive_override(
-            "production_draws", production_draws, recipe.production.segment_size
-        ),
-    ).validate()
-    recipe = replace(recipe, production=effective_production).validate()
-    total_draws = int(effective_production.segment_size)
-    if readout_prefixes is None:
-        prefixes = (total_draws,)
-    else:
-        if isinstance(readout_prefixes, (str, bytes)):
-            raise MCMCInferenceError("readout_prefixes must be integer draw counts")
-        normalized = []
-        for value in readout_prefixes:
-            if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
-                raise MCMCInferenceError(
-                    "readout_prefixes must contain positive integers"
-                )
-            prefix = int(value)
-            if prefix < 1 or prefix > total_draws:
-                raise MCMCInferenceError(
-                    "readout prefix must lie between 1 and production_draws"
-                )
-            normalized.append(prefix)
-        prefixes = tuple(sorted(set(normalized) | {total_draws}))
+    total_draws = int(config["segment_size"])
     if readout_artifact_manifest is None and (
         (artifact_root is None) != (arm_id is None)
     ):
         raise MCMCInferenceError(
             "artifact_root and arm_id must either both be set or both be omitted"
         )
+    if arm_id is not None:
+        try:
+            _validate_arm_id(arm_id)
+        except MCMCDrawArtifactError as exc:
+            raise MCMCInferenceError(str(exc)) from exc
+        destination = Path(artifact_root).expanduser().resolve() / arm_id
+        if destination.exists():
+            raise MCMCInferenceError(f"draw artifact already exists: {destination}")
     grid_x = np.asarray(grid_x_model, np.float32).reshape(-1, 1)
     grid_v_raw = np.asarray(grid_v_raw, np.float32)
     truth = np.asarray(truth_original_units, np.float64).reshape(-1)
@@ -541,71 +253,50 @@ def run_mcmc_grid(
         grid_x.shape[0] == grid_v_raw.shape[0] == truth.shape[0]
     ):
         raise MCMCInferenceError("grid_x, grid_v and truth must have equal rows")
+    if _RECIPE_BY_MODEL_FAMILY[_model_family(model)] != str(family):
+        raise MCMCInferenceError("family recipe does not match the model")
+    if preprocessor.dimension != int(model.params["v_dim"]):
+        raise MCMCInferenceError("preprocessor dimension does not match model v_dim")
     grid_v_model = preprocessor.transform(grid_v_raw)
+    if str(family) == "mnist_pixel" and (
+        np.any(grid_v_model[:, 1:785] < 0.0) or np.any(grid_v_model[:, 1:785] > 255.0)
+    ):
+        raise MCMCInferenceError("MNIST pixel values must lie in raw scale [0,255]")
     table = build_query_table(grid_x, grid_v_model)
-    seeds = derive_mcmc_seeds(family, data_seed, checkpoint_identity)
-    resolved = resolve_target(model, preprocessor, global_power=1.0)
-    if resolved.spec.target_kind != recipe.target_kind:
-        raise MCMCInferenceError("family recipe target_kind mismatch")
+    grid_arrays = _grid_arrays(table, truth)
+    readout_context = {
+        "truth_label": str(truth_label),
+        "outcome_shift": float(outcome_shift),
+        "outcome_scale": float(outcome_scale),
+        "truth_noise_sd": float(TRUTH_NOISE_SD),
+        "treatment_transform": {
+            "shift": float(treatment_transform["shift"]),
+            "scale": float(treatment_transform["scale"]),
+        },
+    }
 
     if loaded_artifact is not None:
-        provenance = loaded_artifact["provenance"]
+        settings = loaded_artifact["settings"]
 
         def require_equal(name: str, actual: Any, expected: Any) -> None:
             if actual != expected:
                 raise MCMCInferenceError(f"draw artifact {name} mismatch")
 
-        require_equal("family", provenance.get("family"), str(family))
-        require_equal(
-            "checkpoint identity",
-            provenance.get("checkpoint_identity"),
-            str(checkpoint_identity),
-        )
-        require_equal("data seed", provenance.get("data_seed"), int(data_seed))
-        require_equal("seeds", provenance.get("seeds"), seeds)
-        require_equal("run label", provenance.get("run_label"), str(run_label))
-        require_equal("recipe", provenance.get("recipe_hash"), recipe.recipe_hash)
-        require_equal(
-            "production config",
-            provenance.get("production_config"),
-            recipe.production.to_payload(),
-        )
-        require_equal(
-            "target",
-            provenance.get("target_hash"),
-            resolved.spec.manifest["target_hash"],
-        )
-        artifact_grid = provenance.get("grid")
-        if not isinstance(artifact_grid, Mapping):
-            raise MCMCInferenceError("draw artifact grid provenance is missing")
-        current_grid = {
-            "num_queries": int(table.num_queries),
-            "num_targets": int(table.num_targets),
-            "truth_label": str(truth_label),
-            "truth_hash": sha256_array(truth),
-            "catalog_hash": table.catalog_hash,
-            "query_hash": table.query_hash,
-            "preprocessor_identity": str(preprocessor.identity),
-        }
-        for name, expected in current_grid.items():
-            require_equal(name, artifact_grid.get(name), expected)
-        readout_context = provenance.get("readout_context")
-        if not isinstance(readout_context, Mapping):
-            raise MCMCInferenceError("draw artifact readout context is missing")
-        current_readout_context = {
-            "outcome_shift": float(outcome_shift),
-            "outcome_scale": float(outcome_scale),
-            "truth_noise_sd": float(truth_noise_sd),
-            "treatment_transform": {
-                "shift": float(treatment_transform["shift"]),
-                "scale": float(treatment_transform["scale"]),
-            },
-        }
-        require_equal("readout context", readout_context, current_readout_context)
+        require_equal("family", settings.get("family"), str(family))
+        require_equal("source checkpoint", settings.get("source"), source)
+        require_equal("seeds", settings.get("seeds"), seeds)
+        require_equal("production config", settings.get("production_config"), config)
+        require_equal("readout context", settings.get("readout_context"), readout_context)
+        if set(loaded_grid) != set(grid_arrays):
+            raise MCMCInferenceError("draw artifact grid is incomplete")
+        for name, expected in grid_arrays.items():
+            stored = loaded_grid[name]
+            if stored.shape != expected.shape or not np.array_equal(stored, expected):
+                raise MCMCInferenceError(f"draw artifact grid {name} mismatch")
         latent_dim = int(sum(int(value) for value in model.params["z_dims"]))
         expected_shape = (
             total_draws,
-            int(recipe.production.num_chains),
+            int(config["num_chains"]),
             int(table.num_targets),
             latent_dim,
         )
@@ -620,27 +311,63 @@ def run_mcmc_grid(
             f"{table.num_queries} full-grid queries"
         )
     if loaded_artifact is None:
-        variance, pilot = estimate_pilot_state_variance(
+        latent_dim = int(sum(int(value) for value in model.params["z_dims"]))
+        pilot_started = time.time()
+        pilot_draws, _ = _sample(
             model,
-            resolved,
-            table,
-            recipe,
+            table.unique_v,
             run_seed=seeds["pilot"],
-            run_label=run_label,
+            num_chains=4,
+            warmup_steps=pilot_config["warmup_steps"],
+            initial_step_size=pilot_config["initial_step_size"],
+            num_leapfrog_steps=pilot_config["num_leapfrog_steps"],
+            target_accept_prob=0.9,
+            segment_size=pilot_config["segment_size"],
+            trajectory_support=pilot_config["trajectory_support"],
+            jitter_scale=pilot_config["jitter_scale"],
+            variance=np.ones((table.num_targets, latent_dim), np.float32),
+            label="pilot",
             progress=progress,
         )
-        production = run_mcmc(
+        raw = np.var(pilot_draws, axis=0, ddof=1).mean(axis=0)
+        if not np.all(np.isfinite(raw)) or np.any(raw <= 0.0):
+            raise MCMCInferenceError("pilot variance estimate is not positive/finite")
+        variance = regularize_state_variance(raw).astype(np.float32)
+        pilot = {
+            "seconds": float(time.time() - pilot_started),
+            "raw_variance_median": float(np.median(raw)),
+            "regularized_variance_median": float(np.median(variance)),
+        }
+        production_started = time.time()
+        draws, acceptance = _sample(
             model,
-            table,
-            preprocessor=preprocessor,
+            table.unique_v,
             run_seed=seeds["production"],
-            run_label=run_label,
-            config=recipe.production,
-            state_variance=variance,
+            num_chains=config["num_chains"],
+            warmup_steps=config["warmup_steps"],
+            initial_step_size=config["initial_step_size"],
+            num_leapfrog_steps=config["num_leapfrog_steps"],
+            target_accept_prob=config["target_accept_prob"],
+            segment_size=config["segment_size"],
+            trajectory_support=config["trajectory_support"],
+            jitter_scale=config["overdispersion_scale"],
+            variance=variance,
+            label="production",
             progress=progress,
         )
+        per_chain = np.mean(acceptance, axis=1)
+        production = {
+            "draws": draws,
+            "seconds": float(time.time() - production_started),
+            "run_seed": int(seeds["production"]),
+            "config": config,
+            "acceptance": {
+                "mean": float(np.mean(acceptance)),
+                "minimum": float(np.min(acceptance)),
+                "per_chain": [float(value) for value in per_chain],
+            },
+        }
     else:
-        provenance = loaded_artifact["provenance"]
         pilot = {
             "skipped": True,
             "seconds": 0.0,
@@ -650,57 +377,33 @@ def run_mcmc_grid(
             "draws": loaded_draws,
             "seconds": 0.0,
             "run_seed": int(seeds["production"]),
-            "run_key": provenance.get("production_run_key"),
-            "target": resolved.spec.manifest,
-            "config": recipe.production.to_payload(),
-            "acceptance": provenance.get("production_acceptance"),
+            "config": config,
+            "acceptance": loaded_artifact["settings"].get("production_acceptance"),
         }
         if progress:
             progress(
-                f"[mcmc {family}] verified draw artifact; skipping pilot and production"
+                f"[mcmc {family}] checked draw artifact; skipping pilot and production"
             )
 
     artifact = loaded_artifact
     artifact_seconds = float(artifact_load_seconds)
     if artifact_root is not None:
         artifact_started = time.time()
-        artifact_provenance = {
-            "family": str(family),
-            "checkpoint_identity": str(checkpoint_identity),
-            "data_seed": int(data_seed),
-            "seeds": seeds,
-            "run_label": str(run_label),
-            "recipe_hash": recipe.recipe_hash,
-            "production_config": production["config"],
-            "production_run_key": production["run_key"],
-            "production_acceptance": production["acceptance"],
-            "target": production["target"],
-            "target_hash": production["target"]["target_hash"],
-            "grid": {
-                "num_queries": int(table.num_queries),
-                "num_targets": int(table.num_targets),
-                "truth_label": str(truth_label),
-                "truth_hash": sha256_array(truth),
-                "catalog_hash": table.catalog_hash,
-                "query_hash": table.query_hash,
-                "preprocessor_identity": str(preprocessor.identity),
-            },
-            "readout_context": {
-                "outcome_shift": float(outcome_shift),
-                "outcome_scale": float(outcome_scale),
-                "truth_noise_sd": float(truth_noise_sd),
-                "treatment_transform": {
-                    "shift": float(treatment_transform["shift"]),
-                    "scale": float(treatment_transform["scale"]),
-                },
-            },
-        }
         try:
             artifact = save_draw_artifact(
                 production["draws"],
                 artifact_root=artifact_root,
                 arm_id=str(arm_id),
-                provenance=artifact_provenance,
+                settings={
+                    "family": str(family),
+                    "source": source,
+                    "seeds": seeds,
+                    "recipe": recipe,
+                    "production_config": production["config"],
+                    "production_acceptance": production["acceptance"],
+                    "readout_context": readout_context,
+                },
+                grid=grid_arrays,
             )
         except MCMCDrawArtifactError as exc:
             raise MCMCInferenceError(str(exc)) from exc
@@ -711,87 +414,47 @@ def run_mcmc_grid(
                 f"{artifact['artifact_dir']}"
             )
 
-    readout_config = replace(
-        recipe.readout, truth_noise_sd=float(truth_noise_sd)
-    )
     readout_runner = FullGridReadout(
         model,
         table,
         truth,
         outcome_shift=float(outcome_shift),
         outcome_scale=float(outcome_scale),
-        config=readout_config,
     )
-    prefix_readouts: dict[str, dict[str, Any]] = {}
-    readout_seconds: dict[str, float] = {}
-    for prefix in prefixes:
-        readout_started = time.time()
-        prefix_readout = readout_runner(production["draws"][:prefix])
-        elapsed = time.time() - readout_started
-        prefix_readout["readout_seconds"] = float(elapsed)
-        prefix_readouts[str(prefix)] = prefix_readout
-        readout_seconds[str(prefix)] = float(elapsed)
-        if progress:
-            label = (
-                f"[mcmc {family}]"
-                if prefix == total_draws
-                else f"[mcmc {family} prefix={prefix}]"
-            )
-            progress(
-                f"{label} structural MSE "
-                f"{prefix_readout['structural_mse_plugin']:.6f}; "
-                f"cov95 {prefix_readout['coverage']['0.95']:.6f}; "
-                f"width80 {prefix_readout['width80']:.6f}"
-            )
-    readout = prefix_readouts[str(total_draws)]
-    uq_seconds = readout_seconds[str(total_draws)]
+    readout_started = time.time()
+    readout = readout_runner(production["draws"])
+    uq_seconds = time.time() - readout_started
+    readout["readout_seconds"] = float(uq_seconds)
+    if progress:
+        progress(
+            f"[mcmc {family}] cov95 {readout['coverage']['0.95']:.6f}; "
+            f"width95 {readout['width95']:.6f}"
+        )
     result = {
-        "schema_version": "bgm-mcmc-inference",
         "family": str(family),
-        "target_kind": str(recipe.target_kind),
-        "recipe": recipe.to_payload(),
-        "recipe_hash": recipe.recipe_hash,
-        "checkpoint_identity": str(checkpoint_identity),
-        "data_seed": int(data_seed),
+        "recipe": recipe,
         "seeds": seeds,
-        "run_label": str(run_label),
-        "mode": (
-            "artifact-readout" if loaded_artifact is not None else "sample-and-readout"
-        ),
         "grid": {
             "num_queries": int(table.num_queries),
             "num_targets": int(table.num_targets),
             "truth_label": str(truth_label),
-            "truth_hash": sha256_array(truth),
-            "catalog_hash": table.catalog_hash,
-            "query_hash": table.query_hash,
-            "preprocessor_identity": str(preprocessor.identity),
         },
         "sampler": {
-            "config": production["config"],
-            "config_hash": sha256_json("mcmc-config", production["config"]),
             "run_seed": production["run_seed"],
-            "run_key": production["run_key"],
-            "target": production["target"],
-            "target_hash": production["target"]["target_hash"],
             "acceptance": production["acceptance"],
         },
         "pilot": pilot,
         "readout": readout,
-        "readouts": prefix_readouts,
         "artifact": artifact,
         "treatment_transform": {
             "shift": float(treatment_transform["shift"]),
             "scale": float(treatment_transform["scale"]),
         },
-        "execution_environment": execution_environment(),
         "timings": {
             "pilot_seconds": float(pilot["seconds"]),
             "mcmc_seconds": float(production["seconds"]),
             "artifact_seconds": float(artifact_seconds),
             "uq_seconds": float(uq_seconds),
-            "readout_seconds_by_prefix": readout_seconds,
-            "readout_total_seconds": float(sum(readout_seconds.values())),
             "total_seconds": float(time.time() - started),
         },
     }
@@ -800,12 +463,7 @@ def run_mcmc_grid(
 
 __all__ = [
     "FAMILY_RECIPES",
-    "FamilyRecipe",
-    "MCMCConfig",
     "MCMCInferenceError",
-    "derive_mcmc_seeds",
-    "estimate_pilot_state_variance",
     "execution_environment",
-    "run_mcmc",
     "run_mcmc_grid",
 ]

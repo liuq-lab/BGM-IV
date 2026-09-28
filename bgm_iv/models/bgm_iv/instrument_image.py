@@ -1,12 +1,13 @@
 import tensorflow as tf
-import tensorflow_probability as tfp
 
 from .instrument import BGM_IV
 from ..networks import DemandImageCovariateDecoder, DemandImageEncoder
 
+_SIGMA_TIME = 0.1
+
 
 class BGM_IV_Image(BGM_IV):
-    """Image-aware IV model for the MNIST demand-design benchmark."""
+    """BGM-IV with convolutional covariate networks for image covariates."""
 
     def __init__(
         self,
@@ -16,8 +17,8 @@ class BGM_IV_Image(BGM_IV):
         auto_restore_checkpoint=True,
     ):
         params = dict(params)
-        if int(params.get("v_dim", 0)) < 785:
-            raise ValueError("`BGM_IV_Image` requires `v_dim >= 785`.")
+        if int(params.get("v_dim", 0)) != 785:
+            raise ValueError("`BGM_IV_Image` requires `v_dim == 785` (time + 28x28 image).")
         if int(params.get("w_dim", 0)) != 1:
             raise ValueError("`BGM_IV_Image` requires `w_dim == 1`.")
 
@@ -29,8 +30,6 @@ class BGM_IV_Image(BGM_IV):
         )
 
         z_dim = sum(self.params["z_dims"])
-        self.image_dim = 28 * 28
-        self.extra_noise_dim = int(self.params["v_dim"]) - 1 - self.image_dim
         self.e_net = DemandImageEncoder(
             z_dim=z_dim,
             v_dim=self.params["v_dim"],
@@ -42,14 +41,7 @@ class BGM_IV_Image(BGM_IV):
             name="g_net",
         )
         self.initialize_nets()
-        # Determinism contract: the image decoder is the only BGM-IV network
-        # with BatchNormalization, and FusedBatchNormGradV3 has no
-        # deterministic GPU kernel.  Flip every BN layer to the non-fused
-        # path right after the eager build and BEFORE the checkpoint restore
-        # / any tf.function trace, so restore-path consumers (MCMC inference
-        # and feature export) get the same numerics as training
-        # without having to remember a manual call.  fit() re-applies it as
-        # an idempotent guard.
+        # Non-fused BatchNormalization: the fused GPU gradient is not deterministic.
         self._apply_bn_determinism()
 
         self.ckpt = tf.train.Checkpoint(
@@ -73,7 +65,7 @@ class BGM_IV_Image(BGM_IV):
             self.ckpt.restore(self.ckpt_manager.latest_checkpoint)
             print("Latest checkpoint restored!!")
 
-    def initialize_nets(self, print_summary=False):
+    def initialize_nets(self):
         z_dim = sum(self.params["z_dims"])
         z0_dim = self.params["z_dims"][0]
         z1_dim = self.params["z_dims"][1]
@@ -85,70 +77,36 @@ class BGM_IV_Image(BGM_IV):
         self.h_net(
             tf.zeros((1, z0_dim + z2_dim + self.params["w_dim"]), dtype=tf.float32)
         )
-        if print_summary:
-            print(self.g_net.summary())
-            print(self.e_net.summary())
-            print(self.f_net.summary())
-            print(self.h_net.summary())
 
     @staticmethod
     def _split_public_covariates(data_v):
         data_v = tf.cast(data_v, tf.float32)
         time = data_v[:, :1]
-        image_raw = data_v[:, 1:785]
-        noise = data_v[:, 785:]
-        image_norm = image_raw / 255.0
-        return time, image_raw, image_norm, noise
+        image_norm = data_v[:, 1:785] / 255.0
+        return time, image_norm
 
     def _decode_covariates(self, data_z, training=True):
-        decoded = self.g_net(data_z, training=training)
-        if "sigma_time_softfloor" in self.params:
-            # Soft variance floor: keep the head
-            # LEARNABLE but bounded below — sigma = sigma_min + sigma_learned,
-            # where sigma_learned = sqrt(learned softplus-positive variance).
-            # Unlike the fixed override, gradients keep flowing to the head;
-            # unlike the raw head, the MLE cannot collapse below sigma_min.
-            if "sigma_time" in self.params:
-                raise ValueError(
-                    "sigma_time and sigma_time_softfloor are mutually exclusive"
-                )
-            decoded = dict(decoded)
-            sigma_min = tf.cast(
-                float(self.params["sigma_time_softfloor"]), tf.float32
-            )
-            decoded["time_var"] = tf.square(
-                sigma_min + tf.sqrt(decoded["time_var"])
-            )
-        elif "sigma_time" in self.params:
-            # Fixed time-observation noise (mirrors the demand ``sigma_v``
-            # override); see instrument_vector._decode_covariates.
-            decoded = dict(decoded)
-            decoded["time_var"] = tf.ones_like(decoded["time_var"]) * tf.cast(
-                float(self.params["sigma_time"]) ** 2, tf.float32
-            )
+        decoded = dict(self.g_net(data_z, training=training))
+        decoded["time_var"] = tf.ones_like(decoded["time_var"]) * tf.cast(
+            _SIGMA_TIME ** 2, tf.float32
+        )
         return decoded
 
-    def _covariate_loss_terms(self, data_v, data_z, training=True,
-                              block_scale="sum"):
-        time_obs, _, image_obs, noise_obs = self._split_public_covariates(data_v)
+    def _covariate_loss_terms(self, data_v, data_z, training=True):
+        time_obs, image_obs = self._split_public_covariates(data_v)
         decoded = self._decode_covariates(data_z, training=training)
 
         time_mean = decoded["time_mean"]
         time_var = decoded["time_var"]
         image_logits = decoded["image_logits"]
         image_probs = decoded["image_probs"]
-        noise_mean = decoded["noise_mean"]
-        noise_var = decoded["noise_var"]
 
         time_nll = tf.squeeze(
             ((time_obs - time_mean) ** 2) / (2.0 * time_var)
             + 0.5 * tf.math.log(time_var),
             axis=1,
         )
-        block_reduce = (
-            tf.reduce_sum if block_scale == "sum" else tf.reduce_mean
-        )
-        image_nll = block_reduce(
+        image_nll = tf.reduce_sum(
             tf.nn.sigmoid_cross_entropy_with_logits(
                 labels=image_obs,
                 logits=image_logits,
@@ -157,343 +115,37 @@ class BGM_IV_Image(BGM_IV):
         )
         mse_time = tf.reduce_mean((time_obs - time_mean) ** 2)
         mse_image = tf.reduce_mean((image_obs - image_probs) ** 2)
-        loss_terms = [time_nll, image_nll]
-        mse_terms = [mse_time, mse_image]
-        if self.extra_noise_dim > 0:
-            noise_nll = block_reduce(
-                ((noise_obs - noise_mean) ** 2) / (2.0 * noise_var)
-                + 0.5 * tf.math.log(noise_var),
-                axis=1,
-            )
-            mse_noise = tf.reduce_mean((noise_obs - noise_mean) ** 2)
-            loss_terms.append(noise_nll)
-            mse_terms.append(mse_noise)
-        mse_v = tf.add_n(mse_terms) / float(len(mse_terms))
-        return tf.add_n(loss_terms), mse_v, decoded
+        mse_v = tf.add_n([mse_time, mse_image]) / 2.0
+        return tf.add_n([time_nll, image_nll]), mse_v, decoded
 
     def _covariate_cycle_mse(self, observed_v, reconstructed_v):
-        observed_time, _, observed_image, observed_noise = self._split_public_covariates(observed_v)
-        reconstructed_time, _, reconstructed_image, reconstructed_noise = self._split_public_covariates(
+        observed_time, observed_image = self._split_public_covariates(observed_v)
+        reconstructed_time, reconstructed_image = self._split_public_covariates(
             reconstructed_v
         )
         mse_time = tf.reduce_mean((observed_time - reconstructed_time) ** 2)
         mse_image = tf.reduce_mean((observed_image - reconstructed_image) ** 2)
-        mse_terms = [mse_time, mse_image]
-        if self.extra_noise_dim > 0:
-            mse_terms.append(tf.reduce_mean((observed_noise - reconstructed_noise) ** 2))
-        return tf.add_n(mse_terms) / float(len(mse_terms))
+        return tf.add_n([mse_time, mse_image]) / 2.0
 
-    @tf.function
-    def update_g_net(self, data_z, data_v, eps=1e-6):
+    def _covariate_nll(self, data_v, data_z, training, eps=1e-6):
         del eps
-        with tf.GradientTape() as gen_tape:
-            loss_terms, loss_mse, _ = self._covariate_loss_terms(
-                data_v, data_z, training=True,
-                block_scale=str(self.params["covariate_block_scale"]),
-            )
-            loss_v = tf.reduce_mean(loss_terms)
-            if self.params["use_bnn"]:
-                loss_v += sum(self.g_net.losses) * self.params["kl_weight"]
+        return self._covariate_loss_terms(data_v, data_z, training=training)[0]
 
-        g_gradients = gen_tape.gradient(loss_v, self.g_net.trainable_variables)
-        self.g_optimizer.apply_gradients(zip(g_gradients, self.g_net.trainable_variables))
-        return loss_v, loss_mse
-
-    @tf.function
-    def update_latent_variable_sgd(
-        self, data_x, data_y, data_v, data_w, batch_idx, include_outcome=True, eps=1e-6
-    ):
+    def _covariate_train_loss(self, data_z, data_v, eps=1e-6):
         del eps
-        with tf.GradientTape() as tape:
-            data_z = tf.gather(self.data_z, batch_idx, axis=0)
+        loss_terms, _, _ = self._covariate_loss_terms(data_v, data_z, training=True)
+        return tf.reduce_mean(loss_terms)
 
-            loss_pv_z, _, _ = self._covariate_loss_terms(
-                data_v, data_z, training=True,
-                block_scale=str(self.params["covariate_block_scale"]),
-            )
-            loss_pv_z = tf.reduce_mean(loss_pv_z)
+    def _covariate_reconstruction(self, data_z):
+        return self._decode_covariates(data_z, training=False)["public_v"]
 
-            treatment_output = self._treatment_output(data_z, data_w)
-            mu_x = treatment_output[:, :1]
-            if self.params["binary_treatment"]:
-                loss_px_z = tf.reduce_mean(
-                    tf.nn.sigmoid_cross_entropy_with_logits(labels=data_x, logits=mu_x)
-                )
-            else:
-                sigma_square_x = self._continuous_sigma(
-                    treatment_output, sigma_key="sigma_x"
-                )
-                loss_px_z = self._gaussian_nll(data_x, mu_x, sigma_square_x, event_dim=1)
-                loss_px_z = tf.reduce_mean(loss_px_z)
+    def _egm_covariate_block(self, data_z, data_v):
+        decoded = self._decode_covariates(data_z, training=True)
+        data_v_ = decoded["public_v"]
 
-            if include_outcome:
-                loss_py_z = -tf.reduce_mean(
-                    self._integrated_outcome_log_prob(
-                        data_z,
-                        data_w,
-                        data_y,
-                        n_samples=int(self.params["iv_mc_samples"]),
-                    )
-                )
-            else:
-                loss_py_z = tf.constant(0.0, dtype=tf.float32)
-
-            loss_prior_z = tf.reduce_mean(tf.reduce_sum(data_z ** 2, axis=1) / 2.0)
-            loss_posterior_z = (
-                loss_pv_z + loss_prior_z + loss_px_z
-                + self._outcome_to_particles_weight() * loss_py_z
-            )
-
-        posterior_gradients = tape.gradient(loss_posterior_z, [self.data_z])
-        self.posterior_optimizer.apply_gradients(zip(posterior_gradients, [self.data_z]))
-        return loss_posterior_z
-
-    @tf.function
-    def train_gen_step(self, data_z, data_v, data_w, data_x, data_y):
-        with tf.GradientTape(persistent=True) as gen_tape:
-            decoded = self._decode_covariates(data_z, training=True)
-            data_v_ = decoded["public_v"]
-
-            data_z_ = self.e_net(data_v, training=True)
-            data_z0, data_z1, data_z2 = self._split_z(data_z_)
-            data_z__ = self.e_net(data_v_, training=True)
-            data_v__ = self._decode_covariates(data_z_, training=True)["public_v"]
-            data_dz_ = self.dz_net(data_z_)
-
-            l2_loss_v = self._covariate_cycle_mse(data_v, data_v__)
-            l2_loss_z = tf.reduce_mean((data_z - data_z__) ** 2)
-            e_loss_adv = -tf.reduce_mean(data_dz_)
-            sigma_square_loss = tf.reduce_mean(tf.square(decoded["time_var"]))
-            if self.extra_noise_dim > 0:
-                sigma_square_loss += tf.reduce_mean(tf.square(decoded["noise_var"]))
-
-            h_output = self.h_net(tf.concat([data_z0, data_z2, data_w], axis=-1))
-            data_x_ = h_output[:, :1]
-            if self.params["binary_treatment"]:
-                l2_loss_x = tf.reduce_mean(
-                    tf.nn.sigmoid_cross_entropy_with_logits(labels=data_x, logits=data_x_)
-                )
-                deconfounded_x = tf.sigmoid(data_x_)
-            else:
-                sigma_square_loss += tf.reduce_mean(tf.square(h_output[:, -1]))
-                l2_loss_x = tf.reduce_mean((data_x_ - data_x) ** 2)
-                deconfounded_x = data_x_
-
-            f_output = self.f_net(tf.concat([data_z0, data_z1, deconfounded_x], axis=-1))
-            data_y_ = f_output[:, :1]
-            sigma_square_loss += tf.reduce_mean(tf.square(f_output[:, -1]))
-            l2_loss_y = tf.reduce_mean((data_y_ - data_y) ** 2)
-
-            g_e_loss = (
-                e_loss_adv
-                + (l2_loss_v + self.params["use_z_rec"] * l2_loss_z)
-                + l2_loss_x
-                + l2_loss_y
-                + 0.001 * sigma_square_loss
-            )
-
-        trainable_variables = (
-            self.g_net.trainable_variables
-            + self.e_net.trainable_variables
-            + self.f_net.trainable_variables
-            + self.h_net.trainable_variables
-        )
-        g_e_gradients = gen_tape.gradient(g_e_loss, trainable_variables)
-        self.g_pre_optimizer.apply_gradients(zip(g_e_gradients, trainable_variables))
-        return e_loss_adv, l2_loss_v, l2_loss_z, l2_loss_x, l2_loss_y, g_e_loss
-
-    @tf.function
-    def train_gen_step_integral(self, data_z, data_v, data_w, data_x, data_y):
-        """Integral-EGM step for the image-covariate variant: this class's
-        v-side machinery + the base class's integrated outcome block."""
-        with tf.GradientTape(persistent=True) as gen_tape:
-            decoded = self._decode_covariates(data_z, training=True)
-            data_v_ = decoded["public_v"]
-
-            data_z_ = self.e_net(data_v, training=True)
-            data_z0, data_z1, data_z2 = self._split_z(data_z_)
-            data_z__ = self.e_net(data_v_, training=True)
-            data_v__ = self._decode_covariates(data_z_, training=True)["public_v"]
-            data_dz_ = self.dz_net(data_z_)
-
-            l2_loss_v = self._covariate_cycle_mse(data_v, data_v__)
-            l2_loss_z = tf.reduce_mean((data_z - data_z__) ** 2)
-            e_loss_adv = -tf.reduce_mean(data_dz_)
-            sigma_square_loss = tf.reduce_mean(tf.square(decoded["time_var"]))
-            if self.extra_noise_dim > 0:
-                sigma_square_loss += tf.reduce_mean(tf.square(decoded["noise_var"]))
-
-            h_output = self.h_net(tf.concat([data_z0, data_z2, data_w], axis=-1))
-            data_x_ = h_output[:, :1]
-            if self.params["binary_treatment"]:
-                l2_loss_x = tf.reduce_mean(
-                    tf.nn.sigmoid_cross_entropy_with_logits(
-                        labels=data_x, logits=data_x_
-                    )
-                )
-                prob_x = tf.sigmoid(data_x_)
-                if str(self.params["egm_outcome_grad_path"]) == "stop":
-                    prob_x = tf.stop_gradient(prob_x)
-                f_out_one = self.f_net(
-                    tf.concat([data_z0, data_z1, tf.ones_like(data_x_)], axis=-1)
-                )
-                f_out_zero = self.f_net(
-                    tf.concat([data_z0, data_z1, tf.zeros_like(data_x_)], axis=-1)
-                )
-                data_y_ = prob_x * f_out_one[:, :1] + (1.0 - prob_x) * f_out_zero[:, :1]
-                sigma_square_loss += tf.reduce_mean(tf.square(f_out_one[:, -1]))
-                sigma_square_loss += tf.reduce_mean(tf.square(f_out_zero[:, -1]))
-            else:
-                sigma_square_loss += tf.reduce_mean(tf.square(h_output[:, -1]))
-                l2_loss_x = tf.reduce_mean((data_x_ - data_x) ** 2)
-
-                sigma_mode = self.params["egm_outcome_sigma"]
-                if sigma_mode == "head":
-                    sigma_square_x = self._continuous_sigma(
-                        h_output, sigma_key="sigma_x"
-                    )
-                elif sigma_mode == "residual_ema":
-                    batch_resid = tf.stop_gradient(
-                        tf.reduce_mean(tf.square(data_x - data_x_))
-                    )
-                    self.egm_sigma2_x_ema.assign(
-                        0.99 * self.egm_sigma2_x_ema + 0.01 * batch_resid
-                    )
-                    sigma_square_x = self.egm_sigma2_x_ema * tf.ones_like(data_x_)
-                else:
-                    sigma_square_x = float(sigma_mode) ** 2 * tf.ones_like(data_x_)
-                cap = float(self.params["egm_outcome_sigma_cap"])
-                sigma_square_x = tf.minimum(sigma_square_x, cap ** 2)
-
-                sigma_x = tf.stop_gradient(tf.sqrt(sigma_square_x))
-                if str(self.params["egm_outcome_grad_path"]) == "stop":
-                    x_center = tf.stop_gradient(data_x_)
-                else:
-                    x_center = data_x_
-                x_nodes = (
-                    x_center[None, :, :]
-                    + 1.4142135623730951 * sigma_x[None, :, :] * self._egm_gh_t
-                )
-                f_outputs = self._outcome_outputs_for_samples(data_z_, x_nodes)
-                data_y_ = tf.reduce_sum(self._egm_gh_w * f_outputs[:, :, :1], axis=0)
-                sigma_square_loss += tf.reduce_mean(tf.square(f_outputs[:, :, -1]))
-
-            l2_loss_y = tf.reduce_mean((data_y_ - data_y) ** 2)
-
-            g_e_loss = (
-                e_loss_adv
-                + (l2_loss_v + self.params["use_z_rec"] * l2_loss_z)
-                + l2_loss_x
-                + l2_loss_y
-                + 0.001 * sigma_square_loss
-            )
-
-        trainable_variables = (
-            self.g_net.trainable_variables
-            + self.e_net.trainable_variables
-            + self.f_net.trainable_variables
-            + self.h_net.trainable_variables
-        )
-        g_e_gradients = gen_tape.gradient(g_e_loss, trainable_variables)
-        self.g_pre_optimizer.apply_gradients(zip(g_e_gradients, trainable_variables))
-        return e_loss_adv, l2_loss_v, l2_loss_z, l2_loss_x, l2_loss_y, g_e_loss
-
-    @tf.function
-    def evaluate(self, data, data_z=None, nb_intervals=200):
-        data_x, data_y, data_v, data_w = data
-        if data_z is None:
-            data_z = self.e_net(data_v, training=False)
-
-        data_z0, data_z1, _ = self._split_z(data_z)
-        data_v_pred = self._decode_covariates(data_z, training=False)["public_v"]
-        data_x_pred = self._treatment_mean(data_z, data_w)
-        data_y_pred = self._integrated_outcome_mean(
-            data_z,
-            data_w,
-            n_samples=int(self.params["eval_mc_samples"]),
-            sample_y=False,
-        )
-
-        mse_v = self._covariate_cycle_mse(data_v, data_v_pred)
-        mse_x = tf.reduce_mean((data_x - data_x_pred) ** 2)
-        mse_y = tf.reduce_mean((data_y - data_y_pred) ** 2)
-
-        if self.params["binary_treatment"]:
-            y_pred_pos = self.f_net(
-                tf.concat([data_z0, data_z1, tf.ones((len(data_x), 1))], axis=-1)
-            )[:, :1]
-            y_pred_neg = self.f_net(
-                tf.concat([data_z0, data_z1, tf.zeros((len(data_x), 1))], axis=-1)
-            )[:, :1]
-            ite_pre = y_pred_pos - y_pred_neg
-            return ite_pre, mse_x, mse_y, mse_v
-
-        x_min = tfp.stats.percentile(data_x, 5.0)
-        x_max = tfp.stats.percentile(data_x, 95.0)
-        x_values = tf.linspace(x_min, x_max, nb_intervals)
-
-        def compute_dose_response(x):
-            data_x_tile = tf.cast(tf.fill([tf.shape(data_x)[0], 1], x), tf.float32)
-            y_pred = self.f_net(tf.concat([data_z0, data_z1, data_x_tile], axis=-1))[
-                :, :1
-            ]
-            return tf.reduce_mean(y_pred)
-
-        dose_response = tf.map_fn(
-            compute_dose_response, x_values, fn_output_signature=tf.float32
-        )
-        return dose_response, mse_x, mse_y, mse_v
-
-    @tf.function
-    def get_log_posterior(self, data_x, data_y, data_v, data_w, data_z, eps=1e-6):
-        del eps
-        loss_pv_z, _, _ = self._covariate_loss_terms(data_v, data_z, training=False)
-
-        treatment_output = self._treatment_output(data_z, data_w)
-        mu_x = treatment_output[:, :1]
-        if self.params["binary_treatment"]:
-            loss_px_z = tf.squeeze(
-                tf.nn.sigmoid_cross_entropy_with_logits(labels=data_x, logits=mu_x)
-            )
-        else:
-            sigma_square_x = self._continuous_sigma(treatment_output, sigma_key="sigma_x")
-            loss_px_z = self._gaussian_nll(data_x, mu_x, sigma_square_x, event_dim=1)
-
-        loss_py_z = -self._integrated_outcome_log_prob(
-            data_z,
-            data_w,
-            data_y,
-            n_samples=int(self.params["iv_mc_samples"]),
-        )
-        loss_prior_z = tf.reduce_sum(data_z ** 2, axis=1) / 2.0
-        return -(loss_pv_z + loss_px_z + loss_py_z + loss_prior_z)
-
-    @tf.function
-    def get_log_partial_posterior(self, data_x, data_v, data_w, data_z, eps=1e-6):
-        del eps
-        loss_pv_z, _, _ = self._covariate_loss_terms(data_v, data_z, training=False)
-
-        treatment_output = self._treatment_output(data_z, data_w)
-        mu_x = treatment_output[:, :1]
-        if self.params["binary_treatment"]:
-            loss_px_z = tf.squeeze(
-                tf.nn.sigmoid_cross_entropy_with_logits(labels=data_x, logits=mu_x)
-            )
-        else:
-            sigma_square_x = self._continuous_sigma(treatment_output, sigma_key="sigma_x")
-            loss_px_z = self._gaussian_nll(data_x, mu_x, sigma_square_x, event_dim=1)
-
-        loss_prior_z = tf.reduce_sum(data_z ** 2, axis=1) / 2.0
-        return -(loss_pv_z + loss_px_z + loss_prior_z)
-
-    @tf.function
-    def get_log_covariate_posterior(self, data_v, data_z, eps=1e-6):
-        del eps
-        loss_pv_z, _, _ = self._covariate_loss_terms(
-            data_v,
-            data_z,
-            training=False,
-            block_scale=str(self.params.get("covariate_block_scale", "sum")),
-        )
-        loss_prior_z = tf.reduce_sum(data_z ** 2, axis=1) / 2.0
-        return -(loss_pv_z + loss_prior_z)
+        data_z_ = self.e_net(data_v, training=True)
+        data_z0, data_z1, data_z2 = self._split_z(data_z_)
+        data_z__ = self.e_net(data_v_, training=True)
+        data_v__ = self._decode_covariates(data_z_, training=True)["public_v"]
+        sigma_square_loss = tf.reduce_mean(tf.square(decoded["time_var"]))
+        return sigma_square_loss, data_z_, (data_z0, data_z1, data_z2), data_z__, data_v__

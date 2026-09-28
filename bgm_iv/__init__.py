@@ -4,29 +4,25 @@ from typing import TYPE_CHECKING
 __version__ = "0.1.0"
 
 if TYPE_CHECKING:
-    from . import datasets, models, utils
+    from . import datasets, models
     from .models.bgm_iv import (
         BGM_IV,
         BGM_IV_Image,
-        BGM_IV_Vector,
     )
 
 _SYMBOL_TO_MODULE = {
     "BGM_IV": "bgm_iv.models.bgm_iv",
     "BGM_IV_Image": "bgm_iv.models.bgm_iv",
-    "BGM_IV_Vector": "bgm_iv.models.bgm_iv",
 }
 
 _MODULE_ATTRIBUTES = {
     "models": "bgm_iv.models",
     "datasets": "bgm_iv.datasets",
-    "utils": "bgm_iv.utils",
 }
 
 __all__ = [
     "BGM_IV",
     "BGM_IV_Image",
-    "BGM_IV_Vector",
 ]
 
 
