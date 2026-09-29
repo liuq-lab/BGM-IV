@@ -142,8 +142,8 @@ If you use BGM-IV in your research, please cite the paper:
 
 ```bibtex
 @misc{luo2026bgmivaipoweredbayesiangenerative,
-      title={BGM-IV: an AI-powered Bayesian generative modeling approach for instrumental variable analysis}, 
-      author={Guyue Luo and Qiao Liu},
+      title={BGM-IV: AI-Powered Bayesian Generative Modeling for Instrumental Variable Regression with High-Dimensional Covariates}, 
+      author={Guyue Luo and Haidong Lu and Andrew J. Loza and Qiao Liu},
       year={2026},
       eprint={2605.07029},
       archivePrefix={arXiv},
